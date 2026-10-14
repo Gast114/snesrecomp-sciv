@@ -261,6 +261,14 @@ int  snes_netplay_state_barrier(void);
  */
 void snes_netplay_diag_tick(void);
 
+/* Always-on, bounded observations. Call the termination logger only after the
+ * final disconnect decision and before shutdown; it logs once per session.
+ * Slow operations are measured by the caller (monotonic elapsed milliseconds),
+ * reported at >=250 ms, and rate-limited. Neither helper changes netplay policy.
+ * Both are no-ops when offline or when netplay is not compiled in. */
+void snes_netplay_log_peer_disconnect(uint32_t timeout_ms);
+void snes_netplay_note_slow_operation(const char *operation, uint64_t elapsed_ms);
+
 #ifdef __cplusplus
 }
 #endif

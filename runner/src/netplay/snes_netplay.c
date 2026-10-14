@@ -11,6 +11,7 @@
 
 #if defined(SNESRECOMP_NET)
 #include "recomp_net/recomp_net.h"
+#include "snes_netplay_diagnostic_state.h"
 /*
  * Rollback is an optional build (snesrecomp_enable_rollback). A game that
  * links netplay without it must still compile, so everything the rollback
@@ -38,6 +39,7 @@ static inline const char *snes_netplay_rb_refusal(void) { return NULL; }
 static inline void snes_netplay_rb_set_hold(uint32_t tick) { (void)tick; }
 static inline void snes_netplay_rb_clear_hold(void) {}
 static inline int  snes_netplay_rb_hold_settled(void) { return 0; }
+static inline const char *snes_netplay_rb_stall_tag(void) { return "none"; }
 #endif
 #include "common_rtl.h"
 #include "common_cpu_infra.h"
@@ -209,6 +211,12 @@ int  snes_netplay_request_load(int slot)
 }
 int  snes_netplay_state_barrier(void) { return 0; }
 void snes_netplay_diag_tick(void) {}
+void snes_netplay_log_peer_disconnect(uint32_t timeout_ms) { (void)timeout_ms; }
+void snes_netplay_note_slow_operation(const char *operation, uint64_t elapsed_ms)
+{
+    (void)operation;
+    (void)elapsed_ms;
+}
 
 #else /* SNESRECOMP_NET */
 
@@ -288,6 +296,9 @@ typedef struct {
     unsigned     ice_turn_port;
     int          diag_session; /* bumped each start; resets diag file */
     uint32_t     frames_finished; /* RtlRunFrame + finish_frame count */
+    NetplayDiagnosticState timing;
+    char         last_slow_operation[48];
+    char         max_slow_operation[48];
 } NetplayState;
 
 static NetplayState g_np;
@@ -320,6 +331,104 @@ static void np_apply_published(const uint16_t *buttons, int slots)
  * after the rollback host starts cleanly, so a failed start falls back to
  * delay-sync rather than leaving the session with no admit path at all. */
 static int g_np_rollback;
+
+static uint64_t np_diagnostic_clock_ms(void)
+{
+    uint64_t counter = SDL_GetPerformanceCounter();
+    uint64_t frequency = SDL_GetPerformanceFrequency();
+    /* Divide first so a long machine uptime cannot overflow counter*1000. */
+    return frequency ? (counter / frequency) * 1000u +
+                       (counter % frequency) * 1000u / frequency
+                     : (uint64_t)SDL_GetTicks();
+}
+
+static void np_diagnostic_slow(const char *kind, const char *operation,
+                                uint64_t elapsed_ms)
+{
+    RNetSessionStats st;
+    rnet_session_get_stats(g_np.session, &st);
+    fprintf(stderr,
+            "snes_netplay: local_slow kind=%s operation=%.47s elapsed_ms=%llu "
+            "monotonic_ms=%llu session=%u slot=%d transport=%s sim=%u "
+            "peer_rx_age_ms=%llu peer_gone=%d remote_wire=%u "
+            "pump_gap_max_ms=%llu pump_duration_max_ms=%llu\n",
+            kind, operation, (unsigned long long)elapsed_ms,
+            (unsigned long long)np_diagnostic_clock_ms(),
+            (unsigned)g_np.session_id, g_np.local_slot,
+            snes_netplay_transport_name(), (unsigned)st.sim_tick,
+            (unsigned long long)st.last_peer_rx_age_ms, st.peer_gone,
+            (unsigned)st.highest_remote_wire,
+            (unsigned long long)g_np.timing.max_gap_ms,
+            (unsigned long long)g_np.timing.max_duration_ms);
+}
+
+void snes_netplay_note_slow_operation(const char *operation, uint64_t elapsed_ms)
+{
+    uint64_t now;
+    if (!snes_netplay_active() || elapsed_ms < NP_SLOW_MS) return;
+    g_np.timing.operation_ms = elapsed_ms;
+    snprintf(g_np.last_slow_operation, sizeof(g_np.last_slow_operation), "%s",
+             operation && operation[0] ? operation : "unknown");
+    if (elapsed_ms > g_np.timing.max_operation_ms) {
+        g_np.timing.max_operation_ms = elapsed_ms;
+        snprintf(g_np.max_slow_operation, sizeof(g_np.max_slow_operation), "%s",
+                 g_np.last_slow_operation);
+    }
+    now = np_diagnostic_clock_ms();
+    if (np_diagnostic_report(&g_np.timing, NP_REPORT_OPERATION, elapsed_ms, now))
+        np_diagnostic_slow("operation", g_np.last_slow_operation, elapsed_ms);
+}
+
+void snes_netplay_log_peer_disconnect(uint32_t timeout_ms)
+{
+    RNetSessionStats st;
+    uint64_t budget, now;
+    const char *reason, *stall;
+    if (!snes_netplay_active() || g_np.timing.termination_logged) return;
+    if (!timeout_ms) timeout_ms = 1500u;
+    if (!snes_netplay_peer_disconnected(timeout_ms)) return;
+    rnet_session_get_stats(g_np.session, &st);
+    reason = np_diagnostic_disconnect_reason(&st);
+    budget = st.peer_gone ? 0 : timeout_ms;
+    if (!strcmp(reason, "initial_link_budget")) {
+        budget = (uint64_t)timeout_ms * 60u;
+        if (budget < 90000u) budget = 90000u;
+    }
+    now = np_diagnostic_clock_ms();
+    stall = g_np_rollback ? snes_netplay_rb_stall_tag() : rnet_admit_stall_name(st.last_stall);
+    g_np.timing.termination_logged = 1;
+    fprintf(stderr,
+            "snes_netplay: peer_disconnect_detail reason=%s timeout_ms=%u "
+            "effective_budget_ms=%llu monotonic_ms=%llu session=%u slot=%d "
+            "transport=%s sim=%u frames_finished=%u peer_rx_age_ms=%llu "
+            "peer_gone=%d peer_gone_mask=%08x remote_wire=%u remote_lead=%d "
+            "packets_rx=%u input_bundle_attempts=%u stall=%s "
+            "session_age_ms=%llu pump_gap_ms=%llu pump_gap_max_ms=%llu "
+            "last_slow_pump_gap_ms=%llu pump_duration_ms=%llu "
+            "pump_duration_max_ms=%llu slow_operation=%.47s "
+            "slow_operation_ms=%llu slow_operation_max_ms=%llu "
+            "slow_operation_max_name=%.47s\n",
+            reason, (unsigned)timeout_ms, (unsigned long long)budget,
+            (unsigned long long)now, (unsigned)g_np.session_id, g_np.local_slot,
+            snes_netplay_transport_name(), (unsigned)st.sim_tick,
+            (unsigned)g_np.frames_finished,
+            (unsigned long long)st.last_peer_rx_age_ms, st.peer_gone,
+            (unsigned)st.peer_gone_mask, (unsigned)st.highest_remote_wire,
+            st.remote_lead, (unsigned)st.packets_rx, (unsigned)st.input_bundle_sends,
+            stall ? stall : "unknown",
+            (unsigned long long)(now >= g_np.timing.session_started_ms
+                                     ? now - g_np.timing.session_started_ms : 0),
+            (unsigned long long)g_np.timing.gap_ms,
+            (unsigned long long)g_np.timing.max_gap_ms,
+            (unsigned long long)g_np.timing.last_slow_gap_ms,
+            (unsigned long long)g_np.timing.duration_ms,
+            (unsigned long long)g_np.timing.max_duration_ms,
+            g_np.last_slow_operation[0] ? g_np.last_slow_operation : "none",
+            (unsigned long long)g_np.timing.operation_ms,
+            (unsigned long long)g_np.timing.max_operation_ms,
+            g_np.max_slow_operation[0] ? g_np.max_slow_operation : "none");
+    fflush(stderr); /* Preserve the final observation before session teardown. */
+}
 
 /* Rollback resolves each seat's row itself (wire row or hold-last invent) and
  * hands the result back here, so snes_netplay_published_inputs() reads the
@@ -811,6 +920,9 @@ int snes_netplay_start(const SnesNetplayConfig *cfg)
 
     g_np.session = rnet_session_create(&rcfg, &host);
     if (!g_np.session) return -2;
+    np_diagnostic_reset(&g_np.timing, np_diagnostic_clock_ms());
+    g_np.last_slow_operation[0] = '\0';
+    g_np.max_slow_operation[0] = '\0';
 
     if (use_ice) {
 #if defined(RNET_ENABLE_ICE)
@@ -2553,6 +2665,12 @@ void snes_netplay_diag_tick(void)
 
 static void np_pump_session(void)
 {
+    uint64_t began = np_diagnostic_clock_ms(), ended;
+    np_diagnostic_pump_begin(&g_np.timing, began);
+    /* Observe the gap before pumping refreshes peer liveness; a recovered
+     * local stall must remain visible even when the queued packets are fresh. */
+    if (np_diagnostic_report(&g_np.timing, NP_REPORT_GAP, g_np.timing.gap_ms, began))
+        np_diagnostic_slow("pump_gap", "between_pumps", g_np.timing.gap_ms);
 #if defined(SNES_HAS_LOBBY_CLIENT)
     if (g_np.use_ice || snes_lobby_connected())
         snes_lobby_pump();
@@ -2565,6 +2683,11 @@ static void np_pump_session(void)
     np_menu_drive();
     if (rnet_session_is_running(g_np.session))
         np_maybe_start_sram_sync();
+    ended = np_diagnostic_clock_ms();
+    np_diagnostic_pump_end(&g_np.timing, ended);
+    if (np_diagnostic_report(&g_np.timing, NP_REPORT_DURATION,
+                              g_np.timing.duration_ms, ended))
+        np_diagnostic_slow("pump_duration", "session_pump", g_np.timing.duration_ms);
 }
 
 void snes_netplay_pump(void)

@@ -318,6 +318,7 @@ int snes_host_barrier_admit(int from_lobby, int *running,
   }
 
   if (snes_netplay_peer_disconnected(peer_ms)) {
+    snes_netplay_log_peer_disconnect(peer_ms);
     barrier_soft_exit(from_lobby, running, "peer_disconnect", &desync_logged,
                       &wait_logged);
     ice_fail_logged = 0;

@@ -65,6 +65,9 @@ int main(void)
     cfg.enabled = 1;
     check(snes_netplay_start(&cfg) < 0, "offline facade cannot start a session");
     check(!snes_netplay_active(), "netplay remains inactive");
+    snes_netplay_note_slow_operation("offline_snapshot", 2000);
+    snes_netplay_log_peer_disconnect(1500);
+    check(!snes_netplay_active(), "diagnostic helpers are offline no-ops");
     check(!snes_netplay_is_host() && !snes_netplay_menu_ready(), "offline status");
     check(!snes_netplay_menu_open() && !snes_netplay_menu_load(0), "offline menu facade");
 
