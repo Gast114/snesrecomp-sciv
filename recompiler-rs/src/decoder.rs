@@ -3381,26 +3381,25 @@ pub(crate) fn compute_deps(
     let mut sib_pcs: Vec<u32> = Vec::new();
     for di in graph.insns() {
         let ins = &di.insn;
-        let dispatch_targets: Vec<u32> =
-            if ins.dispatch_call && ins.dispatch_entries.is_some() {
-                let bank = (ins.addr >> 16) & 0xFF;
-                ins.dispatch_entries
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .copied()
-                    .filter(|entry| *entry != 0)
-                    .map(|entry| {
-                        if ins.dispatch_kind.as_deref() == Some("long") {
-                            entry & 0xFFFFFF
-                        } else {
-                            addr24(bank, entry & 0xFFFF)
-                        }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let dispatch_targets: Vec<u32> = if ins.dispatch_call && ins.dispatch_entries.is_some() {
+            let bank = (ins.addr >> 16) & 0xFF;
+            ins.dispatch_entries
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .filter(|entry| *entry != 0)
+                .map(|entry| {
+                    if ins.dispatch_kind.as_deref() == Some("long") {
+                        entry & 0xFFFFFF
+                    } else {
+                        addr24(bank, entry & 0xFFFF)
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let tp: Option<u32> = if ins.mnem == "JSR" && ins.length == 3 && ins.mode != Mode::IndirX {
             Some(addr24((ins.addr >> 16) & 0xFF, ins.operand & 0xFFFF))
         } else if ins.mnem == "JSL" {
