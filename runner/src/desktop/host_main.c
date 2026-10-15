@@ -421,6 +421,7 @@ static struct RendererFuncs g_renderer_funcs;
 static int g_savestate_menu_hotkey;
 static int g_rewind_hotkey;
 static int g_open_launcher_hotkey;   /* in_game_launcher only */
+static int g_debug_marker_hotkey;    /* debug_marker_open only */
 static uint64_t g_state_generation;
 
 /* The last field actually presented, kept so an overlay can freeze the guest
@@ -1666,6 +1667,7 @@ typedef struct PadGesture {
 } PadGesture;
 static PadGesture g_rewind_gesture;
 static PadGesture g_launcher_gesture;
+static PadGesture g_debug_marker_gesture;
 
 /* Lower-cased `spec` into bits; returns the number of buttons, or -1 when a
  * name is not a button. */
@@ -2230,6 +2232,55 @@ static void RewindKeyDown(int key, int repeat) {
  * rather than the browser's handle_key/poll_nav. Controls match the other
  * ports: Left/Right scrub (hold to keep scrubbing), Enter or Space commits,
  * Escape cancels, and the pad mirrors them. */
+/* Debug marker's modal pump. The guest stays frozen at the frame boundary
+ * where the title recorded its marker; every SDL event goes to the title's
+ * note panel (typing must reach a text field, so no guest hotkey fires and no
+ * key reaches HandleInput except releases, which keep held directions from
+ * sticking after the close). */
+static void RunDebugMarkerLoop(bool *running) {
+  uint32 prev_pad = OverlayNavInputs();
+  unsigned frames = 0;
+  host_report_breadcrumb("debug marker OPEN - guest frozen until the note is "
+                         "saved or discarded");
+  g_overlay_modal = true;
+  SetAudioPaused(true);
+#if SNESRECOMP_SDL3
+  SDL_StartTextInput(g_window);
+#else
+  SDL_StartTextInput();
+#endif
+  while (g_game->debug_marker_is_open && g_game->debug_marker_is_open() && *running) {
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+      if (g_game->debug_marker_event)
+        g_game->debug_marker_event(&event);
+      if (HandleDeviceEvent(&event))
+        continue;
+      if (event.type == SDL_QUIT)
+        *running = false;
+      else if (event.type == SDL_KEYUP)
+        HandleInput(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event), false);
+    }
+    const uint32 pad = OverlayNavInputs();
+    if (g_game->debug_marker_pump)
+      g_game->debug_marker_pump(pad & ~prev_pad);
+    prev_pad = pad;
+    PresentFrozenWithOverlay();
+    SDL_Delay(8);
+    frames++;
+  }
+#if SNESRECOMP_SDL3
+  SDL_StopTextInput(g_window);
+#else
+  SDL_StopTextInput();
+#endif
+  g_overlay_modal = false;
+  ResetAudioTimeline();
+  SetAudioPaused(g_paused);
+  OverlayNoteClosed();
+  host_report_breadcrumb("debug marker CLOSED after %u pumps - guest resuming", frames);
+}
+
 static void RunRewindLoop(bool *running) {
   uint32 prev_pad = 0;
   uint32 held_dir = 0;
@@ -3396,6 +3447,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   }
   if (game->state_menu_hotkeys) ConfigUseStateMenuDefaults();
   if (game->in_game_launcher) ConfigUseInGameLauncherDefaults();
+  if (game->debug_marker_open) ConfigUseDebugMarkerDefaults();
   /* Before parsing: default [GamepadMap] rows exist for each routed seat. */
   ConfigSetPadSeats(HostConfiguredSeats());
   ParseConfigFile(config_file);
@@ -3469,6 +3521,10 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   if (game->in_game_launcher)
     PadGestureConfigure(&g_launcher_gesture, g_config.launcher_gesture,
                         "Select+L3", "launcher", "LauncherGesture");
+  if (game->debug_marker_open)
+    PadGestureConfigure(&g_debug_marker_gesture, g_config.debug_gesture,
+                        game->in_game_launcher ? "none" : "Select+L3",
+                        "debug marker", "DebugGesture");
   tier2_capture_configure(args.expose_coverage_mod || g_config.expose_coverage_mod,
                           g_config.coverage_capture, args.coverage_capture);
 
@@ -4184,7 +4240,7 @@ error_reading:;
     }
 
     if (g_paused && !g_savestate_menu_hotkey && !g_rewind_hotkey &&
-        !g_open_launcher_hotkey) {
+        !g_open_launcher_hotkey && !g_debug_marker_hotkey) {
       snes_host_clock_reset(&video_clock, MonotonicSeconds(), g_simulation_hz, presentation_hz);
       SDL_Delay(16);
       continue;
@@ -4479,6 +4535,30 @@ error_reading:;
       }
     }
     g_rewind_hotkey = 0;
+    /* Debug marker self-test (SNESRECOMP_DEBUG_MARKER_AT=<frame>, off by
+     * default): opens the marker at that frame, as the hotkey would. */
+    {
+      static long marker_frame = -2;
+      if (marker_frame == -2) {
+        const char *v = HostGetenv("DEBUG_MARKER_AT");
+        marker_frame = v ? strtol(v, NULL, 0) : -1;
+      }
+      if (marker_frame >= 0 && (long)frameCtr == marker_frame) {
+        marker_frame = -1;
+        g_debug_marker_hotkey = 1;
+      }
+    }
+    if (game->debug_marker_open &&
+        (g_debug_marker_hotkey || PadGesturePressed(&g_debug_marker_gesture)) &&
+        !snes_rewind_is_open() && !snes_savestate_menu_is_open()) {
+      g_debug_marker_hotkey = 0;
+      if (game->debug_marker_open()) {
+        RunDebugMarkerLoop(&running);
+        if (!running) break;
+        continue;   /* guest was frozen: no frame to run or present */
+      }
+    }
+    g_debug_marker_hotkey = 0;
     /* Exactly ONE poll_open per frame: it latches the previous word to edge
      * detect on, so a second call in the same frame eats the edge. */
     (void)snes_savestate_menu_poll_open(human);
@@ -4837,6 +4917,9 @@ static void HandleCommand(uint32 j, bool pressed) {
     case kKeys_Screenshot: RequestScreenshot(); break;
     case kKeys_OpenLauncher:
       if (g_game->in_game_launcher) g_open_launcher_hotkey = 1;
+      break;
+    case kKeys_DebugMarker:
+      if (g_game->debug_marker_open) g_debug_marker_hotkey = 1;
       break;
     case kKeys_ToggleRenderer:
       g_ppu_render_flags ^= kPpuRenderFlags_NewRenderer;

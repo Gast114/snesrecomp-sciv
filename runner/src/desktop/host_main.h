@@ -198,6 +198,21 @@ typedef struct SnesDesktopHostGame {
   /* After the gameplay loop ends, before SDL resources are destroyed or a
    * relaunch begins. Stop title-owned workers here. No further frames run. */
   void (*on_shutdown)(void);
+
+  /* Debug markers: [KeyMap] DebugMarker (default Ctrl+D) or [Controller]
+   * DebugGesture (default Select+L3 when the in-game launcher does not own
+   * it) freezes the guest at a frame boundary and calls debug_marker_open,
+   * which records whatever the title wants (a save state, the picture, PPU
+   * and WRAM dumps) and returns nonzero to show its note panel. While
+   * debug_marker_is_open, the host feeds every SDL event to
+   * debug_marker_event (keyboard and text input included -- no guest hotkey
+   * fires), calls debug_marker_pump once per pass with the pad buttons newly
+   * pressed (SNES_PAD_* bits), and presents the frozen frame through the
+   * presenter overlay. NULL debug_marker_open leaves the key unbound. */
+  int (*debug_marker_open)(void);
+  int (*debug_marker_is_open)(void);
+  void (*debug_marker_event)(const void *sdl_event);
+  void (*debug_marker_pump)(uint32_t pad_pressed);
 } SnesDesktopHostGame;
 
 /* The whole program. Returns the process exit code. */

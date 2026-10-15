@@ -91,6 +91,10 @@ void ConfigUseStateMenuDefaults(void) {
 void ConfigUseInGameLauncherDefaults(void) {
   kDefaultKbdControls[kKeys_OpenLauncher] = C(SDLK_l);
 }
+/* Ctrl+D (D for debug) collides with nothing in the table above either. */
+void ConfigUseDebugMarkerDefaults(void) {
+  kDefaultKbdControls[kKeys_DebugMarker] = C(SDLK_d);
+}
 #undef _
 #undef A
 #undef C
@@ -111,7 +115,7 @@ static const KeyNameId kKeyNameId[] = {
   M(Load), M(Save),
   S(Fullscreen), S(Reset),
   S(Pause), S(PauseDimmed), S(Turbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleWidescreen),
-  S(SaveStateMenu), S(Rewind), S(Screenshot), S(OpenLauncher),
+  S(SaveStateMenu), S(Rewind), S(Screenshot), S(OpenLauncher), S(DebugMarker),
 };
 #undef S
 #undef M
@@ -480,6 +484,9 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       return true;
     } else if (StringEqualsNoCase(key, "LauncherGesture")) {
       snprintf(g_config.launcher_gesture, sizeof(g_config.launcher_gesture), "%s", value);
+      return true;
+    } else if (StringEqualsNoCase(key, "DebugGesture")) {
+      snprintf(g_config.debug_gesture, sizeof(g_config.debug_gesture), "%s", value);
       return true;
     } else if (StringStartsWithNoCase(key, "SourceP") && key[7] >= '1' &&
                key[7] < '1' + kSnesHostPadSeats && !key[8]) {

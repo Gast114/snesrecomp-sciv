@@ -63,6 +63,9 @@ enum {
   kKeys_ControlsP7_Last = kKeys_ControlsP7 + 11,
   kKeys_ControlsP8,
   kKeys_ControlsP8_Last = kKeys_ControlsP8 + 11,
+  /* Freeze the guest and record a debug marker
+   * (SnesDesktopHostGame.debug_marker_open). Appended like the others. */
+  kKeys_DebugMarker,
   kKeys_Total,
 };
 
@@ -128,6 +131,10 @@ typedef struct Config {
   /* [Controller] LauncherGesture: the same syntax, opening the launcher
    * mid-game for a host that offers it (default "Select+L3"). */
   char launcher_gesture[64];
+  /* [Controller] DebugGesture: the same syntax, recording a debug marker for
+   * a host that offers one (default "Select+L3" unless the in-game launcher
+   * already owns that gesture). */
+  char debug_gesture[64];
 
   /* Presentation and emulation options the desktop host offers through the
    * launcher's Display page, persisted by WriteConfigFile:
@@ -215,6 +222,8 @@ extern Config g_config;
 void ConfigUseStateMenuDefaults(void);
 /* Opt in before parsing: binds [KeyMap] OpenLauncher to Ctrl+L by default. */
 void ConfigUseInGameLauncherDefaults(void);
+/* Ctrl+D for [KeyMap] DebugMarker, for a host that offers debug markers. */
+void ConfigUseDebugMarkerDefaults(void);
 void ParseConfigFile(const char *filename);
 // Re-apply only the [KeyMap] section (launcher hotkey editor wrote it after
 // the initial parse). Keyboard command map is rebuilt; gamepad map and all
