@@ -1511,6 +1511,9 @@ static bool HandleDeviceEvent(const SDL_Event *event) {
   case SDL_CONTROLLERDEVICEREMOVED:
     gi = GetGamepadInfo(SNESRECOMP_SDL_EVENT_DEVICE(*event));
     if (gi) {
+      for (int button = 0; button < kGamepadBtn_Count; ++button)
+        if ((gi->modifiers & (1u << button)) && gi->last_cmd[button])
+          HandleGamepadInput(gi, button, false);
       memset(gi, 0, sizeof(GamepadInfo));
       gi->joystick_id = -1;
     }
@@ -1538,6 +1541,9 @@ static bool HandleDeviceEvent(const SDL_Event *event) {
   case SDL_JOYDEVICEREMOVED:
     gi = GetGamepadInfo(event->jdevice.which);
     if (gi && gi->raw_joystick) {
+      for (int button = 0; button < kGamepadBtn_Count; ++button)
+        if ((gi->modifiers & (1u << button)) && gi->last_cmd[button])
+          HandleGamepadInput(gi, button, false);
       if (gi->joystick) SDL_JoystickClose(gi->joystick);
       memset(gi, 0, sizeof(GamepadInfo));
       gi->joystick_id = -1;
