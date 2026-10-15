@@ -193,6 +193,8 @@ set(SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/framedump.c
     ${SNESRECOMP_RUNNER_ROOT}/src/state_dump.c
     ${SNESRECOMP_RUNNER_ROOT}/src/host_paths.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/diagnostics/trace_writer.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/diagnostics/replay_writer.c
     ${SNESRECOMP_RUNNER_ROOT}/src/host_args.c
     ${SNESRECOMP_RUNNER_ROOT}/src/launcher.c
     ${SNESRECOMP_RUNNER_ROOT}/src/launcher_cache.c
