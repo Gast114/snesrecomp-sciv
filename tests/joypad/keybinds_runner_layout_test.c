@@ -55,6 +55,9 @@ int main(void){
     ck("Left does not read as Down", !(keybinds_read_player_runner(keys,2) & (1u<<5)));
     /* Multitap seats: player 3 starts unbound, reads its own keys, and its
      * [player3] section survives a save and a reload. */
+    /* A previous run saved P3's binding in this build directory. */
+    keybinds_reset_player(3);
+    keybinds_reset_player(5);
     memset(keys,0,sizeof keys);
     ck("player 3 unbound by default", keybinds_get_button(3,6) == SDL_SCANCODE_UNKNOWN);
     keybinds_set_button(3, 6, SDL_SCANCODE_KP_ENTER);   /* start */
