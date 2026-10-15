@@ -71,6 +71,7 @@
 #include "host_report.h"
 #include "post_mortem.h"
 #include "widescreen.h"
+#include "lua_bridge.h"
 #if defined(RECOMP_LAUNCHER)
 #include "recomp_runtime_ui.h"
 #if defined(SNESRECOMP_IMGUI_ESCAPE_SETTINGS)
@@ -3802,6 +3803,16 @@ error_reading:;
   if (g_mods_ready)
     snes_mod_runtime_activate_plugins_c();
 #endif
+  /* Opt-in local Lua automation (docs/LUA_TCP.md): a -DSNESRECOMP_ENABLE_LUA=ON
+   * build listens when SNESRECOMP_LUA_PORT names a port. Without the build
+   * option every lua_bridge_* call below is an inline no-op. */
+  {
+    const char *lua_port = HostGetenv("LUA_PORT");
+    if (lua_port && lua_port[0] &&
+        lua_bridge_init(g_ram, sizeof(g_ram), snes->cart->rom,
+                        (uint32_t)snes->cart->romSize, atoi(lua_port)) != 0)
+      fprintf(stderr, "[lua] unable to listen on port %s\n", lua_port);
+  }
 #if defined(SNES_HAS_LOBBY_CLIENT)
   if (g_netplay_pending) {
     if (game->netplay_ready) {
@@ -4063,6 +4074,7 @@ error_reading:;
   host_report_breadcrumb("entering main loop");
 
   while (running) {
+    lua_bridge_poll();   /* every iteration, including while paused */
     g_profile_frame = frameCtr + 1;
     if (profile_requested && !g_profile && g_profile_frame >= profile_first) {
       g_profile = true;
@@ -4481,6 +4493,12 @@ error_reading:;
       continue;   /* guest was frozen: no frame to run or present */
     }
     if (g_paused) continue;
+    /* A Lua client holding the machine admits no frame (step N releases N). */
+    if (lua_bridge_paused()) {
+      snes_host_clock_reset(&video_clock, MonotonicSeconds(), g_simulation_hz, presentation_hz);
+      SDL_Delay(1);
+      continue;
+    }
     /* The script ticks HERE, after every path that can leave this iteration
      * without running a frame. Ticked above the overlay checks, an
      * iteration that opened a panel consumed a script frame the guest never
@@ -4505,11 +4523,13 @@ error_reading:;
      * being skipped costs work for a picture nobody is reading. */
     bool runahead_captured = false;
     {
-      const uint32 word = inputs | GetActiveControllers() | debug_server_get_controller_active_mask();
+      const uint32 word = lua_bridge_frame_start(
+          inputs | GetActiveControllers() | debug_server_get_controller_active_mask());
       if (g_turbo || !snes_runahead_run_frame(word))
         RtlRunFrame(word);
       else
         runahead_captured = true;   /* it rasterised the speculated frame */
+      lua_bridge_frame_end();
     }
     ApplyScriptForcePokes();
     snes_osd_note_frame();
@@ -4635,6 +4655,7 @@ error_reading:;
     WriteConfigFile(g_active_config_file);
 
   if (!g_netplay_session) RtlWriteSram();
+  lua_bridge_shutdown();
 #if defined(SNES_HAS_LOBBY_CLIENT)
   /* Reopen the launcher from a clean process. No match state is resumed and
    * offline mod selections are already the durable on-disk plan. */
