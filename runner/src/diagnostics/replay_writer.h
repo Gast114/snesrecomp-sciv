@@ -2,6 +2,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* One simulation producer, one disk worker. All calls except Destroy only
  * copy into a fixed 16 MiB queue; a slow sink stops capture, never waits.
@@ -20,3 +23,6 @@ bool SnesReplayWriterEnd(SnesReplayWriter *);
 const char *SnesReplayWriterError(SnesReplayWriter *);
 /* Only at shutdown or an explicit transition to offline playback. */
 const char *SnesReplayWriterDestroy(SnesReplayWriter *);
+#ifdef __cplusplus
+}
+#endif
