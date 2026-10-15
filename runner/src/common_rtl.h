@@ -308,12 +308,22 @@ bool RtlUploadSpcImageFromDp(CpuState *cpu);
 bool RtlUploadSpcImageFromDpLive(CpuState *cpu);
 bool RtlRunFrame(uint32 inputs);
 void RtlReadSram();
-void RtlWriteSram();
+/* Returns 1 when the battery file was durably replaced, 0 on any failure
+ * (the previous file is left in place). */
+int RtlWriteSram(void);
+int RtlTryWriteSram(void);
 /* Save-directory root for SRAM + savestate slots. Default "saves". Netplay
  * guests use "saves/netplay" so host-driven sync cannot clobber personal files.
  * Pass NULL/"" to restore the default. */
 void RtlSetSaveRoot(const char *root);
 const char *RtlSaveRoot(void);
+/* Optional stable directory for the Quick slot when a host switches SRAM
+ * namespaces (e.g. course packs). NULL/"" follows the current save root.
+ * Numbered slots and battery saves retain their existing paths. */
+void RtlSetQuickSaveRoot(const char *root);
+/* Current RTLS guest prefix, including its header but excluding title extras.
+ * For opt-in preflight of states written by this exact guest schema. */
+size_t RtlSnapshotGuestSize(uint32 *version_out);
 void RtlEnsureSaveDir(void);
 void RtlSaveSlotPath(int slot, char *buf, size_t buflen);
 void RtlSramFilePath(char *buf, size_t buflen);
@@ -329,6 +339,12 @@ bool RtlLoadSnapshot(const char *filename);
 struct SaveLoadInfo;
 void RtlSaveExecutionState(struct SaveLoadInfo *sli);
 bool RtlLoadExecutionState(struct SaveLoadInfo *sli);
+/* Unread bytes in a snapshot stream, or SIZE_MAX for an unknown stream.
+ * Lets game chunks distinguish historical layouts without probing past EOF. */
+size_t RtlStateBytesRemaining(struct SaveLoadInfo *sli);
+/* Propagate failure from a title extension (including allocation failure) to
+ * the caller, so an incomplete snapshot is never reported as saved/loaded. */
+void RtlStateStreamFail(struct SaveLoadInfo *sli);
 void RtlApplyExecutionState(void);
 /* Host timeline invalidation after a successful load or reset. */
 uint64_t RtlStateGeneration(void);
@@ -360,6 +376,15 @@ bool RtlLoadSnapshotFromMemory(const void *data, size_t size);
  */
 size_t RtlRollbackSaveToMemory(void *data, size_t capacity);
 bool RtlRollbackLoadFromMemory(const void *data, size_t size);
+/* Netplay: snapshots two peers in the same guest state write byte-for-byte
+ * alike (the live audio output ring is blanked while writing). The memory
+ * form is the rollback format -- load it with RtlRollbackLoadFromMemory,
+ * which carries the timing residue and keeps the receiver's live ring. */
+size_t RtlNetplaySnapshotToMemory(void *data, size_t capacity);
+/* How much of such a snapshot two peers in one state agree on: all but the
+ * trailing residue, whose absolute cycle counters are host bookkeeping. */
+size_t RtlNetplaySnapshotHashedBytes(size_t size);
+bool RtlSaveSnapshotRingBlanked(const char *filename);
 /* Upper bound for one rollback snapshot; sizes the ring's allocations. */
 size_t RtlRollbackSnapshotBound(void);
 

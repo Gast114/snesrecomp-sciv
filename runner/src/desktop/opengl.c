@@ -61,10 +61,22 @@ extern void MkDir(const char *s);
 /* -1 = decide from config at init. A host that paces presentation itself
  * (an FPS cap, a simulation/presentation split) sets 0 so the swap does not
  * also block; one that wants the driver to pace it sets 1. */
-static int g_vsync_override = -1;
+/* -1 is a legal interval (adaptive), so "did the host say anything?" needs
+ * its own flag rather than a sentinel value. */
+static int g_vsync_override;
+static bool g_vsync_set;
+static void (*g_compute_viewport)(int, int, int, int, SnesDisplayViewport *);
 
-void snesrecomp_opengl_set_vsync(int enable) {
-  g_vsync_override = enable ? 1 : 0;
+void snesrecomp_opengl_set_viewport(void (*compute)(int, int, int, int,
+                                                   SnesDisplayViewport *)) {
+  g_compute_viewport = compute;
+}
+
+/* interval: 0 immediate, 1 wait for the panel, -1 late-swap-tearing
+ * ("Adaptive"). Stored as-is; OpenGLRenderer_Init applies it. */
+void snesrecomp_opengl_set_vsync(int interval) {
+  g_vsync_override = interval;
+  g_vsync_set = true;
 }
 
 static void GL_APIENTRY MessageCallback(GLenum source,
@@ -85,13 +97,45 @@ static void GL_APIENTRY MessageCallback(GLenum source,
     Die("OpenGL error!\n");
 }
 
+static SDL_GLContext g_context;
+/* The shader path that is loaded (or that failed to load), so Reconfigure
+ * reloads only when the setting actually changed. */
+static char g_shader_path[1024];
+static bool g_shader_resolved;
+
+static void ApplySwapInterval(void) {
+  int interval = g_vsync_set ? g_vsync_override
+                             : (g_config.disable_frame_delay ? 0 : 1);
+  /* Not every driver has EXT_swap_control_tear; fall back to an ordinary
+   * wait rather than to immediate, which is what the player did not ask
+   * for. SDL2 returns 0 on success, SDL3 returns true. */
+#if SNESRECOMP_SDL3
+  bool ok = SDL_GL_SetSwapInterval(interval);
+#else
+  bool ok = SDL_GL_SetSwapInterval(interval) == 0;
+#endif
+  if (!ok && interval < 0) SDL_GL_SetSwapInterval(1);
+}
+
+static void LoadShaderFromConfig(void) {
+  const char *want = g_config.shader ? g_config.shader : "";
+  if (g_shader_resolved && strcmp(want, g_shader_path) == 0)
+    return;
+  if (g_glsl_shader) {
+    GlslShader_Destroy(g_glsl_shader);
+    g_glsl_shader = NULL;
+  }
+  snprintf(g_shader_path, sizeof(g_shader_path), "%s", want);
+  g_shader_resolved = true;
+  if (want[0])
+    g_glsl_shader = GlslShader_CreateFromFile(want);
+}
+
 static bool OpenGLRenderer_Init(SDL_Window *window) {
   g_window = window;
   g_context = SDL_GL_CreateContext(window);
 
-  SDL_GL_SetSwapInterval(g_vsync_override >= 0
-                             ? g_vsync_override
-                             : (g_config.disable_frame_delay ? 0 : 1));
+  ApplySwapInterval();
   ogl_LoadFunctions();
 
   if (!ogl_IsVersionGEQ(3, 3))
@@ -212,10 +256,18 @@ static bool OpenGLRenderer_Init(SDL_Window *window) {
     printf("%s\n", infolog);
   }
 
-  if (g_config.shader)
-    g_glsl_shader = GlslShader_CreateFromFile(g_config.shader);
+  LoadShaderFromConfig();
 
   return true;
+}
+
+/* After another GL context was current (the in-game launcher's), or a
+ * presentation setting changed under the live window. Filtering and aspect
+ * are read every frame and need nothing here. */
+static void OpenGLRenderer_Reconfigure(void) {
+  if (g_context) SDL_GL_MakeCurrent(g_window, g_context);
+  ApplySwapInterval();
+  LoadShaderFromConfig();
 }
 
 static void OpenGLRenderer_Destroy(void) {
@@ -349,6 +401,8 @@ static void OpenGLRenderer_EndDraw(void) {
       g_draw_width, g_draw_height, drawable_width, drawable_height,
       SnesDisplayAspect_Clamp(g_config.display_aspect),
       g_config.ignore_aspect_ratio, false, &viewport);
+  if (g_compute_viewport)
+    g_compute_viewport(g_draw_width, g_draw_height, drawable_width, drawable_height, &viewport);
 
   glBindTexture(GL_TEXTURE_2D, g_texture.gl_texture);
   if (g_draw_width == g_texture.width && g_draw_height == g_texture.height) {
@@ -400,6 +454,7 @@ static const struct RendererFuncs kOpenGLRendererFuncs = {
   &OpenGLRenderer_GetOutputSize,
   &OpenGLRenderer_BeginDraw,
   &OpenGLRenderer_EndDraw,
+  &OpenGLRenderer_Reconfigure,
 };
 
 void OpenGLRenderer_Create(struct RendererFuncs *funcs) {

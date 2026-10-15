@@ -83,31 +83,74 @@ def read_rom(path: pathlib.Path) -> bytes:
     return raw
 
 
-def resolve_analyzer(backend: str) -> str:
-    """Point the emitter at the native analyzer when one is available.
+def resolve_project_rom(project_root: pathlib.Path, names: list[str],
+                        explicit: str | None = None) -> pathlib.Path:
+    """The ROM a scaffolded project generates from, or raise ValueError.
 
-    `auto` uses the native analyzer if it is built and the Python analyzer
-    otherwise; `native` insists and fails loudly when it is missing, because
-    silently dropping to a different analyzer would change what gets emitted.
+    Order: an explicit path, then SNESRECOMP_ROM, then a known filename at
+    the project root, then the project's rom.cfg -- the path the setup
+    wizard recorded (and the build stages beside the executable for the
+    launcher). One resolver here, so a project's regen script does not carry
+    its own copy of the search to fall behind.
     """
+    def accept(value: str, source: str) -> pathlib.Path:
+        path = pathlib.Path(value)
+        # The wizard records a Windows path (C:/...). An MSYS/Cygwin Python
+        # opens it fine but does not call it absolute, so never join a
+        # drive-letter path onto the project root.
+        if not path.is_absolute() and not re.match(r"[A-Za-z]:[\\/]", value):
+            path = project_root / path
+        if not path.is_file():
+            raise ValueError(f"{source} names a ROM that does not exist: {value}")
+        return path
+
+    if explicit:
+        return accept(explicit, "--rom")
+    env = os.environ.get("SNESRECOMP_ROM", "")
+    if env:
+        return accept(env, "SNESRECOMP_ROM")
+    for name in names:
+        if (project_root / name).is_file():
+            return project_root / name
+    cache = project_root / "rom.cfg"
+    if cache.is_file():
+        lines = cache.read_text(encoding="utf-8").splitlines()
+        if lines and lines[0].strip():
+            return accept(lines[0].strip(), str(cache))
+    raise ValueError("no ROM found")
+
+
+def resolve_rom_command(arguments: argparse.Namespace) -> int:
+    print(resolve_project_rom(pathlib.Path(arguments.project_root).resolve(),
+                              arguments.name or [], arguments.rom))
+    return 0
+
+
+def resolve_analyzer(backend: str) -> str:
+    """Point the emitter at the native analyzer, the only analyzer there is.
+
+    Packaged builds ship the binary beside this file, so it is named here
+    rather than left to the emitter's repo-relative lookup. In a source
+    checkout without a built binary the emitter builds it. `auto` and
+    `native` both mean native; `python` names the retired analyzer.
+    """
+    if backend == "python":
+        raise RuntimeError(
+            "the Python analyzer was retired; the native analyzer is the "
+            "only one (drop --analysis-backend python)")
     analyzer = ROOT / "recompiler-rs" / "target" / "release" / (
         "snesrecomp-analyze.exe" if os.name == "nt" else "snesrecomp-analyze")
     if analyzer.is_file():
         os.environ["SNESRECOMP_NATIVE_ANALYZER"] = str(analyzer)
-        return backend if backend != "auto" else "native"
-    if backend == "native":
-        raise RuntimeError(
-            "--analysis-backend native was requested but the analyzer is not "
-            f"built at {analyzer} (build it with "
-            "tools/build_native_analyzer.py)")
-    return "python" if backend == "auto" else backend
+    return "native"
 
 
 def run_emit(rom: pathlib.Path, cfg_dir: pathlib.Path, out_dir: pathlib.Path,
              *, backend: str = "auto", cfg_roots: bool = False,
              no_host_root_scan: bool = False,
              source_roots: list[str] | None = None,
-             profile_manifests: list[str] | None = None) -> None:
+             profile_manifests: list[str] | None = None,
+             legacy_profile_rom_sha256: str | None = None) -> None:
     """Generate C from a ROM plus its bank configs. Raises on failure."""
     resolved = resolve_analyzer(backend)
     arguments = [
@@ -132,6 +175,8 @@ def run_emit(rom: pathlib.Path, cfg_dir: pathlib.Path, out_dir: pathlib.Path,
     # its profile and changed the emitted C.
     for manifest in profile_manifests or []:
         arguments.extend(["--profile-manifest", manifest])
+    if legacy_profile_rom_sha256:
+        arguments.extend(["--legacy-profile-rom-sha256", legacy_profile_rom_sha256])
     if run_tool(v2_emit, arguments):
         raise RuntimeError("source generation failed")
 
@@ -292,6 +337,14 @@ def parser() -> argparse.ArgumentParser:
 
     add_generate_parser(commands)
     add_verify_parser(commands)
+
+    resolve = commands.add_parser(
+        "resolve-rom", help="print the ROM a scaffolded project generates from")
+    resolve.add_argument("--project-root", required=True)
+    resolve.add_argument("--rom", help="explicit ROM path (wins over everything)")
+    resolve.add_argument("--name", action="append",
+                         help="known ROM filename at the project root (repeatable)")
+    resolve.set_defaults(handler=resolve_rom_command)
 
     return result
 

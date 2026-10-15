@@ -87,7 +87,25 @@ void dma_reset(Dma* dma) {
 }
 
 void dma_saveload(Dma *dma, SaveLoadInfo *sli) {
-  sli->func(sli, &dma->channel, sizeof(*dma) - offsetof(Dma, channel));
+  /* hdmaPendingInit moved channel from offset 8 to 10, adding two bytes
+   * before dmaTimer and four more tail bytes to the old 216-byte snapshot.
+   * Both layouts shipped as RTLS v7. The following PPU header identifies
+   * the old layout without guessing from guest data. Write the newer layout
+   * explicitly so future host struct alignment cannot change the wire again. */
+  _Static_assert(sizeof(dma->channel) == 208, "DMA channel snapshot layout");
+  uint8_t wire[222] = {0};
+  uint32_t next[2] = {0};
+  bool legacy = sli->peek && sli->peek(sli, 216, next, sizeof(next)) &&
+      next[0] == 0x30555050u &&
+      next[1] == PPU_SAVESTATE_REGS_SIZE + PPU_SAVESTATE_MEM_SIZE;
+  size_t timer = legacy ? 208 : 210;
+  memcpy(wire, dma->channel, sizeof(dma->channel));
+  memcpy(wire + timer, &dma->dmaTimer, sizeof(dma->dmaTimer));
+  memcpy(wire + timer + 4, &dma->dmaBusy, sizeof(dma->dmaBusy));
+  sli->func(sli, wire, legacy ? 216 : sizeof(wire));
+  memcpy(dma->channel, wire, sizeof(dma->channel));
+  memcpy(&dma->dmaTimer, wire + timer, sizeof(dma->dmaTimer));
+  memcpy(&dma->dmaBusy, wire + timer + 4, sizeof(dma->dmaBusy));
 }
 
 uint8_t dma_read(Dma* dma, uint16_t adr) {
@@ -256,10 +274,12 @@ void dma_doDma(Dma* dma) {
   }
 
   // do channel i
+  g_ppu_wlog_src = kPpuWlogDma;
   dma_transferByte(
     dma, dma->channel[i].aAdr, dma->channel[i].aBank,
     dma->channel[i].bAdr + bAdrOffsets[dma->channel[i].mode][dma->channel[i].offIndex++], dma->channel[i].fromB, i
   );
+  g_ppu_wlog_src = kPpuWlogCpu;
   dma->channel[i].offIndex &= 3;
   dma->dmaTimer += 6; // 8 cycles for each byte taken, -2 for this cycle
   if(!dma->channel[i].fixed) {
@@ -369,10 +389,12 @@ void dma_primeHdmaFirstLine(Dma* dma) {
     int len = transferLength[ch->mode & 7];
     for (int j = 0; j < len; j++) {
       uint8_t bAdr = (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode & 7][j]);
+      g_ppu_wlog_src = kPpuWlogHdma;
       if (ch->indirect)
         dma_transferByte(dma, ch->size++, ch->indBank, bAdr, false, i);
       else
         dma_transferByte(dma, ch->tableAdr++, ch->aBank, bAdr, false, i);
+      g_ppu_wlog_src = kPpuWlogCpu;
     }
     *ch = save;
   }
@@ -399,10 +421,12 @@ void dma_doHdma(Dma* dma) {
       int len = transferLength[ch->mode & 7];
       for (int j = 0; j < len; j++) {
         uint8_t bAdr = (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode & 7][j]);
+        g_ppu_wlog_src = kPpuWlogHdma;
         if (ch->indirect)
           dma_transferByte(dma, ch->size++, ch->indBank, bAdr, false, i);
         else
           dma_transferByte(dma, ch->tableAdr++, ch->aBank, bAdr, false, i);
+        g_ppu_wlog_src = kPpuWlogCpu;
       }
     }
 

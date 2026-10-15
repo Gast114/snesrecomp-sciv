@@ -188,6 +188,40 @@ uint64_t s_interp816_opcodes_run = 0; /* dev perf: per-bridge-call opcode count 
 uint64_t interp816_insns_total(void)  { return s_interp816_insns; }
 uint64_t interp816_cycles_total(void) { return s_interp816_cycles; }
 
+/* ── Always-on interpreted-execution map, by 256-byte guest page ───────────
+ *
+ * interp_stats answers "how much of the guest is interpreted"; it cannot
+ * answer "WHICH code". Without that second answer a coverage burndown is
+ * guesswork: a session reads 99% interpreted, picks the routine it happens to
+ * be looking at, and finds out after a regen whether that was the dominant
+ * class. This is the instrument that names the class BEFORE the work.
+ *
+ * Accumulated from instruction zero in every configuration, Release included
+ * (PRINCIPLES.md, "Always-On Rings, Never Arm-and-Hope"): a probe queries the
+ * window it cares about, it never arms a recorder and re-runs a workload.
+ * Page granularity (pc24 >> 8) is 64K counters -- 1 MB of BSS, one indexed
+ * 64-bit add per interpreted instruction, which is noise beside the
+ * interpreter's own per-opcode cost -- and it is fine enough to name a
+ * routine against the cfg symbol map while being immune to the aliasing a
+ * hashed-PC sampler suffers from.
+ *
+ * Cycles, not instructions, is the headline: it is the same unit
+ * interp_stats divides by (g_cpu.cycles), so a page's share here is directly
+ * comparable to the whole-run interpreted share. Instructions are kept beside
+ * it because a page that is all long-cycle opcodes and a page that is a tight
+ * two-cycle loop want different fixes. */
+#define INTERP816_PAGE_COUNT 0x10000u
+static uint64_t s_interp_page_cycles[INTERP816_PAGE_COUNT];
+static uint64_t s_interp_page_insns[INTERP816_PAGE_COUNT];
+
+uint64_t interp816_page_cycles(unsigned page) {
+    return page < INTERP816_PAGE_COUNT ? s_interp_page_cycles[page] : 0;
+}
+uint64_t interp816_page_insns(unsigned page) {
+    return page < INTERP816_PAGE_COUNT ? s_interp_page_insns[page] : 0;
+}
+unsigned interp816_page_count(void) { return INTERP816_PAGE_COUNT; }
+
 /* Dev hotspot sampler (SNESRECOMP_PHASE_MS): top EXACT PCs executed by the
  * interpreter, dumped via interp816_perf_dump(). Keyed by a 12-bit hash of
  * the full pc24 so the dump shows the precise hot instruction, not a page. */
@@ -309,6 +343,13 @@ int interp816_runOpcode(Interp816* cpu) {
   OPCODE_HIST_END(opcode);
   s_interp816_insns++;
   s_interp816_cycles += (uint64_t)cpu->cyclesUsed;
+  {
+    /* Charge the page the OPCODE stood on (_pcb), not the post-execute PC,
+     * so a branch or a jump is attributed to the routine that issued it. */
+    const unsigned _pg = (unsigned)((_pcb >> 8) & 0xFFFFu);
+    s_interp_page_cycles[_pg] += (uint64_t)cpu->cyclesUsed;
+    s_interp_page_insns[_pg]++;
+  }
 #ifdef SNES_COSIM
   { I816RingEnt* e = &g_i816_ring[g_i816_ring_head & (I816_RING_N - 1)];
     e->pc = _pcb; e->op = opcode; e->mf = _mf; e->xf = _xf;
@@ -489,9 +530,9 @@ static uint32_t interp816_adrIdy(Interp816* cpu, uint32_t* low, bool write) {
   if(cpu->dp & 0xff) cpu->cyclesUsed++; // dpr not 0: 1 extra cycle
   uint16_t pointer = interp816_readWord(cpu, (cpu->dp + adr) & 0xffff, (cpu->dp + adr + 1) & 0xffff);
   bool crossed = (pointer >> 8) != ((pointer + cpu->y) >> 8);
-  if(write ? (!cpu->xf || crossed) : crossed) cpu->cyclesUsed++;
-  // Reads pay only on a page crossing. Stores retain their existing 16-bit
-  // index/page-crossing penalty.
+  // W65C816S cycle-table note 4: read penalty for X=0 OR crossing.
+  // Store/RMW base cycles already include the unconditional indexing cycle.
+  if(!write && (!cpu->xf || crossed)) cpu->cyclesUsed++;
   *low = ((cpu->db << 16) + pointer + cpu->y) & 0xffffff;
   return ((cpu->db << 16) + pointer + cpu->y + 1) & 0xffffff;
 }
@@ -536,7 +577,7 @@ static uint32_t interp816_adrAbs(Interp816* cpu, uint32_t* low) {
 static uint32_t interp816_adrAbx(Interp816* cpu, uint32_t* low, bool write) {
   uint16_t adr = interp816_readOpcodeWord(cpu);
   bool crossed = (adr >> 8) != ((adr + cpu->x) >> 8);
-  if(write ? (!cpu->xf || crossed) : crossed) cpu->cyclesUsed++;
+  if(!write && (!cpu->xf || crossed)) cpu->cyclesUsed++;
   *low = ((cpu->db << 16) + adr + cpu->x) & 0xffffff;
   return ((cpu->db << 16) + adr + cpu->x + 1) & 0xffffff;
 }
@@ -544,7 +585,7 @@ static uint32_t interp816_adrAbx(Interp816* cpu, uint32_t* low, bool write) {
 static uint32_t interp816_adrAby(Interp816* cpu, uint32_t* low, bool write) {
   uint16_t adr = interp816_readOpcodeWord(cpu);
   bool crossed = (adr >> 8) != ((adr + cpu->y) >> 8);
-  if(write ? (!cpu->xf || crossed) : crossed) cpu->cyclesUsed++;
+  if(!write && (!cpu->xf || crossed)) cpu->cyclesUsed++;
   *low = ((cpu->db << 16) + adr + cpu->y) & 0xffffff;
   return ((cpu->db << 16) + adr + cpu->y + 1) & 0xffffff;
 }
@@ -933,12 +974,38 @@ static void interp816_doOpcode(Interp816* cpu, uint8_t opcode) {
   switch(opcode) {
     case 0x00: { // brk imp
       if(cpu->brkHookEnabled) {
-        /* Historical main-CPU bridge marker. Current AOT bounces are selected
-         * before opcode execution, so the marker itself is an inert one-byte
-         * trap. Keep that ABI for the fallback tier without imposing a global
-         * callback symbol on independent coprocessor users. */
-        break;
-      } else {
+        /* `brkHookEnabled` dates from a bridge that bounced through PLANTED
+         * BRK markers, where executing one had to be inert. Nothing plants
+         * them any more -- interp_bridge.c states it outright: "The bounce is
+         * via explicit JSR/JSL interception below, not via planted BRKs" --
+         * so the only BRK the main CPU can now execute is one the guest
+         * really reached, which means it is off the rails.
+         *
+         * Swallowing it was actively harmful. Hardware vectors on the FIRST
+         * $00; this continued one byte at a time, so an off-rails run slid
+         * through blank memory, crossed back into real code and corrupted the
+         * stack before anything trapped. Super Metroid's Morph Ball freeze
+         * (DEVELOPMENT.md, 2026-09-19) executed 240 such bytes and only
+         * stopped on an unrelated COP ~9,000 steps later, by which point the
+         * instruction ring held nothing but the slide and the original bad
+         * jump was unrecoverable.
+         *
+         * So: report it once per run and then vector architecturally, which
+         * is both faithful and what stops an off-rails guest AT its fault.
+         * The flag is kept for callers that set it explicitly (SA-1 clears
+         * it) and no longer suppresses the vector. */
+        static int s_brk_reports;
+        if (s_brk_reports < 8) {
+          s_brk_reports++;
+          fprintf(stderr,
+                  "[brk] architectural BRK at $%02X:%04X (m=%d x=%d e=%d "
+                  "sp=$%04X) -- vectoring; a guest that reaches BRK is "
+                  "off the rails\n",
+                  cpu->k, (unsigned)(cpu->pc - 1), (int)cpu->mf, (int)cpu->xf,
+                  (int)cpu->e, (unsigned)cpu->sp);
+        }
+      }
+      {
         /* BRK is a two-byte instruction. The signature byte is fetched before
          * the return address is stacked. */
         interp816_readOpcode(cpu);

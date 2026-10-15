@@ -97,7 +97,16 @@ fi
 FILL_TOKENS="$SCRIPT_DIR/fill_tokens.py"
 PROBE_ROM="$SCRIPT_DIR/probe_rom.py"
 
-PYTHON=${PYTHON:-$(command -v python3 || command -v python || true)}
+PYTHON=${PYTHON:-}
+if [ -z "$PYTHON" ]; then
+  # Windows App Execution Aliases can exist on PATH without running Python.
+  for _snes_python in python3 python; do
+    if "$_snes_python" -c 'import sys; sys.exit(sys.version_info[0] != 3)' >/dev/null 2>&1; then
+      PYTHON=$_snes_python
+      break
+    fi
+  done
+fi
 [ -n "$PYTHON" ] || { echo "setup_project: python3 not found on PATH" >&2; exit 1; }
 
 usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
@@ -172,7 +181,7 @@ fi
 # "master" was hard-coded here once, and every netplay project cut with the
 # default failed to compile snes_host_lobby.c against a recomp-ui that had
 # never heard of the lobby mod-transfer callbacks.
-RECOMP_UI_REF=$(sed -n '1{s/[[:space:]]*$//;p}' "$SCRIPT_DIR/RECOMP_UI_REF" 2>/dev/null || true)
+RECOMP_UI_REF=$(sed -e 's/[[:space:]]*$//' -e 'q' "$SCRIPT_DIR/RECOMP_UI_REF" 2>/dev/null || true)
 [ -n "$RECOMP_UI_REF" ] || RECOMP_UI_REF="master"
 RECOMP_NET_REF=""; RBENGINE_REF=""
 # The framework URL comes from the checkout this script is running out of, so
@@ -759,7 +768,14 @@ EOF
 # path cache the host reads beside its executable, and the build stages
 # this copy there (snesrecomp_target_rom_cache), so the first launch opens
 # on the same dump instead of asking for one. Ignored by git.
-printf '%s\n' "$ROM_ABS" > rom.cfg
+# The desktop executable is native on Windows; an MSYS /c/... or /home/...
+# path only works inside the shell. Keep shell paths for shell operations,
+# but store a Windows path in the launcher's cache.
+ROM_CACHE=$ROM_ABS
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) ROM_CACHE=$(cygpath -m "$ROM_ABS") ;;
+esac
+printf '%s\n' "$ROM_CACHE" > rom.cfg
 
 echo "== Seeding analysis config =="
 "$PYTHON" "$PROBE_ROM" "$ROM_ABS" --quiet --display-name "$NAME" \
@@ -829,7 +845,7 @@ fi
 # call (its lobby client compiles against recomp-ui's API), not this copy of
 # the wizard's -- unless --recomp-ui-ref said otherwise.
 if [ -z "${SET_RECOMP_UI_REF:-}" ] && [ -f snesrecomp/tools/new_project/RECOMP_UI_REF ]; then
-    _pinned_ui_ref=$(sed -n '1{s/[[:space:]]*$//;p}' snesrecomp/tools/new_project/RECOMP_UI_REF)
+    _pinned_ui_ref=$(sed -e 's/[[:space:]]*$//' -e 'q' snesrecomp/tools/new_project/RECOMP_UI_REF)
     if [ -n "$_pinned_ui_ref" ] && [ "$_pinned_ui_ref" != "$RECOMP_UI_REF" ]; then
         echo "== recomp-ui ref from the pinned framework: $_pinned_ui_ref (this wizard said $RECOMP_UI_REF) =="
         RECOMP_UI_REF=$_pinned_ui_ref
@@ -1072,7 +1088,7 @@ if [ -n "$FRAMEWORK_GAPS" ]; then
     echo "  # the pinned framework is missing what this project needs (above);"
     echo "  # fix that first, then:"
 fi
-[ "$GENERATED" -eq 1 ] || echo "  bash tools/regen.sh --rom '$ROM_ABS'"
+[ "$GENERATED" -eq 1 ] || echo "  bash tools/regen.sh   # uses the ROM recorded in rom.cfg"
 [ "$BUILT" -eq 1 ] || echo "  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"
 if [ "$GITHUB_RECOVERY" -eq 1 ]; then
     echo "  gh repo create $GITHUB_OWNER/$GITHUB_REPO --$GITHUB_VISIBILITY --source . --remote=origin"

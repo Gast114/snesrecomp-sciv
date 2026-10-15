@@ -12,6 +12,12 @@
 #include "saveload.h"
 
 typedef struct Ppu Ppu;
+typedef struct PpuMode7HdSurface {
+  uint32_t *pixels;
+  size_t pitch; /* Bytes, including optional row padding. */
+  unsigned width, height; /* Native dimensions, before scale. */
+  unsigned scale;
+} PpuMode7HdSurface;
 typedef void PpuWidescreenLineEnhancer(Ppu *ppu, uint y, bool sub,
                                        void *context);
 
@@ -66,11 +72,28 @@ typedef struct PpuWsElasticSeg {
 
 typedef uint16_t PpuZbufType;
 
+/* Optional host objects composed at the OBJ stage, with normal background
+ * priority, windows, brightness and color math. Pixels are RGB15; bit 15 marks
+ * opacity (including opaque black). No guest palette/VRAM/OAM is replaced.
+ * The caller owns the array and pixels until the next setter/reset. These are
+ * presentation data, excluded from the generic guest snapshot; a title must
+ * restore or regenerate them with its own state. */
+typedef struct PpuExtraObject {
+  int32_t x, y;
+  uint16_t width, height, stride;
+  uint8_t priority, math, oamSlot;
+  uint32_t order; /* stable tie within oamSlot; zero is reserved for native OAM */
+  const uint16_t *pixels;
+} PpuExtraObject;
+
 #if defined(_MSC_VER)
-typedef __declspec(align(8)) struct PpuPixelPrioBufs {
+#define PPU_ALIGN8_PRE __declspec(align(8))
+#define PPU_ALIGN8_POST
 #else
-typedef struct PpuPixelPrioBufs {
+#define PPU_ALIGN8_PRE
+#define PPU_ALIGN8_POST __attribute__((aligned(8)))
 #endif
+typedef PPU_ALIGN8_PRE struct PpuPixelPrioBufs {
   // This holds the prio in the upper 8 bits and the color in the lower 8 bits.
   // Sized for the widescreen border; logical screen x maps to
   // data[x + kPpuExtraLeftRight].
@@ -80,11 +103,9 @@ typedef struct PpuPixelPrioBufs {
   // offset aborts on ARM -- and which ones do shifts whenever a field
   // above them grows.
   PpuZbufType data[kPpuBufWidth];
-#if defined(_MSC_VER)
-} PpuPixelPrioBufs;
-#else
-} __attribute__((aligned(8))) PpuPixelPrioBufs;
-#endif
+} PPU_ALIGN8_POST PpuPixelPrioBufs;
+#undef PPU_ALIGN8_PRE
+#undef PPU_ALIGN8_POST
 
 static inline void PpuWidescreenAdjustPinnedWindowEdges(
     int screen_left, int screen_right, int *w1l, int *w1r, int *w2l,
@@ -293,6 +314,12 @@ struct Ppu {
   // Strict decode of ambiguous left-margin OAM positions. A NULL hint pointer
   // disables strict mode; a zeroed hint array enables strict mode with no slots
   // explicitly allowed.
+  // Host switch for the temporal fallback below. 1 (the default) lets an
+  // unhinted moving OBJ into the margins; 0 admits ONLY hinted slots.
+  // Screens whose margin content the host can enumerate exactly should
+  // turn it off -- a heuristic there shows sprites while the screen moves
+  // and hides them when it stops.
+  uint8_t wsOamMotionGraceOn;
   uint8_t wsOamLeftHintStrict;
   uint8_t wsOamLeftHint[16];
   // Strict decode of the ambiguous 9-bit OAM X band [256, 256+extraRightCur).
@@ -321,11 +348,17 @@ struct Ppu {
   uint32_t renderFlags;
   PpuPixelPrioBufs bgBuffers[2];
   PpuPixelPrioBufs objBuffer;
+  const PpuExtraObject *extraObjects;
+  size_t extraObjectCount;
+  uint16_t objectColors[kPpuBufWidth];
+  uint64_t objectOrder[kPpuBufWidth];
   /* Per-source isolated priority pixels for generic host-overlay captures. */
   PpuPixelPrioBufs overlayBuffers[kPpuOverlaySource_Count];
   PpuOverlayCapture overlayCaptures[kPpuOverlaySource_Count];
   uint32_t renderPitch;
   uint8_t *renderBuffer;
+  /* Optional additional presentation surface; never part of guest state. */
+  PpuMode7HdSurface mode7Hd;
   /* Optional host picture memory. Drawing only: CPU ports and save states
    * always use vram. The caller owns 32768 words until unbound. */
   const uint16_t *renderVram;
@@ -339,6 +372,18 @@ struct Ppu {
   PpuWidescreenLineEnhancer *widescreenLineEnhancer;
   void *widescreenLineEnhancerContext;
 
+  /* Host-only: bumped on every VRAM store (the $2118/$2119 ports, the 16-bit
+   * fast path, and a save-state load). A frame-model host that snapshots the
+   * picture per raster line compares it to tell whether VRAM changed since
+   * its last copy -- a title that uploads character data in a mid-frame
+   * forced blank (Yoshi's Island, line 217) otherwise gets one frame's OAM
+   * drawn with the next frame's tiles. Not guest state; never serialized. */
+  uint32_t vramWriteCount;
+  /* Host-only, same rule, for OAM ($2104, and a save-state load). Tells a
+   * host WHEN the sprite table it is drawing was uploaded, so it can pair it
+   * with whatever produced it. */
+  uint32_t oamWriteCount;
+
   // -- START OF SNAPSHOT, 0x10420 bytes
   uint16_t cgram[0x100];
   uint16_t oam[0x100];
@@ -351,6 +396,20 @@ struct Ppu {
 
 #define SPRITE_PRIO_TO_PRIO(prio, level6) (((prio) * 4 + 2) * 16 + 4 + (level6 ? 2 : 0))
 #define SPRITE_PRIO_TO_PRIO_HI(prio) ((prio) * 4 + 2)
+
+void PpuSetExtraObjects(Ppu *ppu, const PpuExtraObject *objects, size_t count);
+/* Shared by the PPU and title renderers. Existing native objects must publish
+ * order=(((slot-first_slot)&127)<<32), transparent pixels UINT64_MAX, and colors=0. x0 is the
+ * screen coordinate of array element zero. Returns whether a pixel was added. */
+bool PpuComposeExtraObjects(const PpuExtraObject *objects, size_t count,
+    int y, int x0, size_t width, unsigned first_slot,
+    uint16_t *depth, uint16_t *colors, uint64_t *order);
+static inline uint16_t PpuPixelColor(const Ppu *ppu, uint16_t pixel, size_t x) {
+  unsigned layer=(pixel>>8)&15;
+  if (ppu->extraObjectCount && (layer==4 || layer==6) &&
+      (ppu->objectColors[x]&0x8000)) return ppu->objectColors[x]&0x7fff;
+  return ppu->cgram[pixel&255];
+}
 
 // Host-only debug render filter (SNESRECOMP_LAYER_MASK env; ppu.c). Guest
 // state and savestates are untouched — this only gates final composition.
@@ -519,21 +578,46 @@ void ppu_reset(Ppu* ppu);
 bool ppu_checkOverscan(Ppu* ppu);
 void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);
+
+/* Bind an additional XRGB8888 frame with 1..4 samples per native pixel in
+ * each dimension. Width is 256 + twice the current centering budget; height
+ * is 1..240. The caller owns pixels and must unbind before freeing them.
+ * Returns false without changing the binding on invalid dimensions/capacity.
+ * NULL disables HD; reset preserves the binding, just like renderBuffer.
+ * Ordinary Mode 7 is resampled from picture memory. Other modes and unsupported
+ * combinations use nearest-neighbor copies of the normal scanout. Scale 1 is
+ * always a byte-exact copy. The normal output and emulated state are unchanged.
+ * Call again after changing the native viewport width. */
+bool PpuBindMode7HdSurface(Ppu *ppu, uint32_t *pixels, size_t capacity,
+                            size_t pitch, unsigned width, unsigned height,
+                            unsigned scale);
 void ppu_sec_reset(void);
 void ppu_sec_read(double *eval, double *line, double *bg, double *spr,
                   double *compose, double *hdma);
 uint8_t ppu_read(Ppu* ppu, uint8_t adr);
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
+/* Notified on every CPU write to VRAM through $2118/$2119, with the BYTE
+ * address written and the value. Mirrors snes_set_wram_write_log_hook():
+ * a host can name the instruction responsible, which the AOT-side
+ * watchpoints cannot do on the interp816 path. Unset by default. */
+typedef void (*PpuVramWriteLogHook)(uint32_t byte_addr, uint8_t value);
+void ppu_set_vram_write_log_hook(PpuVramWriteLogHook hook);
 
-/* Raster journal — per-line replay of mid-frame INIDISP writes for frame-model
- * hosts. See the block comment in ppu.c. Host calls Begin after its
- * vblank-edge work and ApplyLine in its render loop; the register write path
- * calls Record with the beam line. */
+/* Raster journal — per-line replay of mid-field PPU register writes for
+ * frame-model hosts. See the block comment in ppu.c. The beam cuts it into
+ * fields at V=225 (ppu_rasterFieldBoundary); ppu_write records every display
+ * register write with the beam line. A host arms it with ppu_rasterBegin and
+ * brackets its render loop with RenderBegin / ApplyLine per line / RenderEnd. */
 void ppu_rasterBegin(Ppu *ppu);
 void ppu_rasterRenderBegin(Ppu *ppu);
+void ppu_rasterRenderEnd(Ppu *ppu);
 int  ppu_rasterTakeHdmaen(uint8_t *out);
 void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
 void ppu_rasterApplyLine(Ppu *ppu, int line);
+/* Called by the beam walk when it reaches V=225. */
+void ppu_rasterFieldBoundary(void);
+/* Disarm, for a machine rebuild (session reset). */
+void ppu_rasterReset(void);
 
 /* Scanout latch bypass — set by the debug server around render_inject so an
  * injected OAM/CGRAM state is rendered as given. A frame-model host that
@@ -544,16 +628,46 @@ void ppu_rasterApplyLine(Ppu *ppu, int line);
 extern int g_ppu_scanout_latch_bypass;
 int  ppu_rasterDebugDump(char *out, int cap);
 
-/* Raster journal — per-line replay of mid-frame INIDISP writes for frame-model
- * hosts. See the block comment in ppu.c. Host calls Begin after its
- * vblank-edge work and ApplyLine in its render loop; the register write path
- * calls Record with the beam line. */
-void ppu_rasterBegin(Ppu *ppu);
-void ppu_rasterRenderBegin(Ppu *ppu);
-int  ppu_rasterTakeHdmaen(uint8_t *out);
-void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
-void ppu_rasterApplyLine(Ppu *ppu, int line);
 int  ppu_rasterDebugDump(char *out, int cap);
+/* Always-on PPU register write journal (every build, Release included).
+ *
+ * Every $2100-$2133 write except the bulk data ports ($2104 OAMDATA, $2118/
+ * $2119 VMDATA, $2122 CGDATA) lands in a fixed ring, tagged with the frame
+ * counter, the raster line it takes effect on, and who wrote it. It is the
+ * recomp half of the per-line register diff against the oracle (snesref's
+ * `<tag>.ppuw.tsv`): a layer that is wrong on some lines is a register whose
+ * per-line value differs, and a write journal says which one and who wrote it.
+ * Probes query it; nothing arms it.
+ *
+ * Line attribution: a write made before ppu_runLine(L) of the frame being
+ * rasterized belongs to line L. Writes made after the raster walk ends (the
+ * next frame's CPU half) carry line kPpuWlogPreRaster and the frame counter of
+ * the frame just drawn -- ppu_wlog_collect() files them under the following
+ * frame, which is the one they affect. */
+enum {
+  kPpuWlogCpu = 0, kPpuWlogDma = 1, kPpuWlogHdma = 2, kPpuWlogReplay = 3,
+};
+enum { kPpuWlogPreRaster = 225 };
+typedef struct PpuWlogEntry {
+  uint32_t frame;
+  int16_t line;     /* 0..224, or -1 in collect() output = before the raster */
+  uint16_t reg;     /* CPU address: $21xx, or $420C */
+  uint8_t val;
+  uint8_t src;      /* kPpuWlog* */
+} PpuWlogEntry;
+extern uint8_t g_ppu_wlog_src;
+/* Writes that affected drawn frame `frame`, oldest first. Returns the count
+ * copied (<= cap); *lost is set when the ring has already evicted part of that
+ * frame. */
+int ppu_wlog_collect(uint32_t frame, PpuWlogEntry *out, int cap, int *lost);
+/* HDMAEN is not a PPU register but decides which lines HDMA touches, so the
+ * $420C write path journals itself too. */
+void ppu_wlog_note_reg(uint16_t reg, uint8_t val);
+/* The frame counter and raster line a write made NOW is attributed to, by the
+ * same rule as the journal. Lets other always-on rings (the DMA ring) file
+ * their events on the line they affect. */
+void ppu_wlog_position(uint32_t *frame, int16_t *line);
+
 void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
 void PpuResetWidescreenOamHistory(Ppu *ppu);

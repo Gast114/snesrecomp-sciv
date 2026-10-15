@@ -1,4 +1,5 @@
 #include "ppu.h"
+#include "mode7_hd.h"
 
 extern unsigned char g_snesrecomp_last_hdmaen;
 #include "ppu_legacy.h"
@@ -63,6 +64,7 @@ void ppu_sec_read(double *eval, double *line, double *bg, double *spr,
 #endif
 
 static void PpuDrawWholeLine(Ppu *ppu, uint y);
+static void PpuDrawMode7HdLine(Ppu *ppu, unsigned line);
 
 static bool ppu_evaluateSprites(Ppu* ppu, int line);
 static uint16_t ppu_getVramRemap(Ppu* ppu);
@@ -72,7 +74,8 @@ static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line);
 Ppu* ppu_init(void) {
   Ppu* ppu = calloc(1, sizeof(Ppu));  /* zero padding: saveload/co-sim hash determinism */
   if (ppu)
-    ppu->wsOamMotionLastLine = -1;
+    ppu->wsOamMotionGraceOn = 1;
+  ppu->wsOamMotionLastLine = -1;
   return ppu;
 }
 
@@ -85,6 +88,7 @@ void ppu_reset(Ppu* ppu) {
     size_t pitch = ppu->renderPitch;
     uint8_t *renderBuffer = ppu->renderBuffer;
     uint32_t renderFlags = ppu->renderFlags;
+    PpuMode7HdSurface mode7Hd = ppu->mode7Hd;
     uint32_t overlayPitch[kPpuOverlaySource_Count];
     uint8_t *overlayBuffer[kPpuOverlaySource_Count];
     memcpy(overlayPitch, ppu->overlayRenderPitch, sizeof(overlayPitch));
@@ -93,10 +97,12 @@ void ppu_reset(Ppu* ppu) {
     ppu->renderBuffer = renderBuffer;
     ppu->renderPitch = (uint32_t)pitch;
     ppu->renderFlags = renderFlags;
+    ppu->mode7Hd = mode7Hd;
     memcpy(ppu->overlayRenderPitch, overlayPitch, sizeof(overlayPitch));
     memcpy(ppu->overlayRenderBuffer, overlayBuffer, sizeof(overlayBuffer));
   }
   ppu->vramIncrement = 1;
+  ppu->wsOamMotionGraceOn = 1;
   ppu->wsOamMotionLastLine = -1;
 }
 
@@ -106,12 +112,27 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
   uint32 version[2] = {'P' | 'P' << 8 | 'U' << 16 | '0' << 24, PPU_SAVESTATE_REGS_SIZE + PPU_SAVESTATE_MEM_SIZE};
   sli->func(sli, version, 8);
   sli->func(sli, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
+  /* The write counters must move on a load (it replaces VRAM and OAM
+   * wholesale) and must NOT move on a save: rewind and run-ahead save every
+   * few frames, and a host pairing "OAM was just uploaded" with what produced
+   * it would take each snapshot for an upload. There is no direction flag,
+   * so compare what the call left behind. */
+  static uint16_t vram_before[0x8000], oam_before[0x100];
+  static uint8_t high_before[0x20];
+  memcpy(vram_before, ppu->vram, sizeof(vram_before));
+  memcpy(oam_before, ppu->oam, sizeof(oam_before));
+  memcpy(high_before, ppu->highOam, sizeof(high_before));
   sli->func(sli, &ppu->cgram, PPU_SAVESTATE_MEM_SIZE);
+  if (memcmp(vram_before, ppu->vram, sizeof(vram_before)) != 0) ppu->vramWriteCount++;
+  if (memcmp(oam_before, ppu->oam, sizeof(oam_before)) != 0 ||
+      memcmp(high_before, ppu->highOam, sizeof(high_before)) != 0)
+    ppu->oamWriteCount++;
 }
 
 void PpuResetWidescreenOamHistory(Ppu *ppu) {
   if (!ppu)
     return;
+  ppu->wsOamMotionGraceOn = 1;
   ppu->wsOamMotionLastLine = -1;
   memset(ppu->wsOamMotionX, 0, sizeof(ppu->wsOamMotionX));
   memset(ppu->wsOamMotionSig, 0, sizeof(ppu->wsOamMotionSig));
@@ -170,6 +191,25 @@ void PpuSetWidescreenLineEnhancer(Ppu *ppu,
                                   void *context) {
   ppu->widescreenLineEnhancer = enhancer;
   ppu->widescreenLineEnhancerContext = enhancer ? context : NULL;
+}
+
+bool PpuBindMode7HdSurface(Ppu *ppu, uint32_t *pixels, size_t capacity,
+                            size_t pitch, unsigned width, unsigned height,
+                            unsigned scale) {
+  if (!ppu) return false;
+  if (!pixels) {
+    memset(&ppu->mode7Hd, 0, sizeof(ppu->mode7Hd));
+    return true;
+  }
+  if (width < 256 || width > kPpuBufWidth || (width & 1) ||
+      !height || height > 240 || !scale || scale > 4 ||
+      (uintptr_t)pixels % sizeof(uint32_t) || pitch % sizeof(uint32_t) ||
+      pitch < width * scale * sizeof(uint32_t) ||
+      pitch > SIZE_MAX / (height * scale) ||
+      capacity < pitch * height * scale)
+    return false;
+  ppu->mode7Hd = (PpuMode7HdSurface){pixels, pitch, width, height, scale};
+  return true;
 }
 
 void PpuClearOverlayCaptures(Ppu *ppu) {
@@ -664,8 +704,72 @@ static inline uint8 PpuMosaicAt(Ppu *ppu, int i) {
  * instrumentation only -- it never affects rendering. */
 static int s_oam_snap_frame = -1;
 
+/* PPU register write journal -- see ppu.h. */
+#define PPU_WLOG_CAP (1u << 17)
+static PpuWlogEntry s_wlog[PPU_WLOG_CAP];
+static uint32_t s_wlog_head;          /* total entries ever written */
+static int s_wlog_line = kPpuWlogPreRaster;
+static uint32_t s_wlog_line_frame = 0xffffffffu;
+uint8_t g_ppu_wlog_src = kPpuWlogCpu;
+
+void ppu_wlog_note_reg(uint16_t reg, uint8_t val) {
+  const uint32_t frame = (uint32_t)snes_frame_counter;
+  PpuWlogEntry *e = &s_wlog[s_wlog_head++ & (PPU_WLOG_CAP - 1)];
+  e->frame = frame;
+  /* The line cursor belongs to the frame whose raster set it; the first
+   * writes of a new frame's raster (HDMA for line 0) come before any
+   * ppu_runLine of that frame. */
+  e->line = (int16_t)(frame == s_wlog_line_frame ? s_wlog_line : 0);
+  e->reg = reg;
+  e->val = val;
+  e->src = g_ppu_wlog_src;
+}
+
+void ppu_wlog_position(uint32_t *frame, int16_t *line) {
+  const uint32_t f = (uint32_t)snes_frame_counter;
+  if (frame) *frame = f;
+  if (line) *line = (int16_t)(f == s_wlog_line_frame ? s_wlog_line : 0);
+}
+
+static void ppu_wlog_note(uint8_t adr, uint8_t val) {
+  if (adr == 0x04 || adr == 0x18 || adr == 0x19 || adr == 0x22 || adr > 0x33)
+    return;
+  ppu_wlog_note_reg((uint16_t)(0x2100u + adr), val);
+}
+
+int ppu_wlog_collect(uint32_t frame, PpuWlogEntry *out, int cap, int *lost) {
+  const uint32_t n = s_wlog_head < PPU_WLOG_CAP ? s_wlog_head : PPU_WLOG_CAP;
+  const uint32_t first = s_wlog_head - n;
+  int count = 0;
+  if (lost) {
+    /* The oldest surviving entry is already inside the requested window:
+     * part of it may have been evicted. */
+    const PpuWlogEntry *o = &s_wlog[first & (PPU_WLOG_CAP - 1)];
+    *lost = n == PPU_WLOG_CAP &&
+            (o->frame > frame - 1u ||
+             (o->frame == frame - 1u && o->line >= kPpuWlogPreRaster) ||
+             o->frame == frame);
+  }
+  for (uint32_t i = first; i != s_wlog_head && count < cap; i++) {
+    const PpuWlogEntry *e = &s_wlog[i & (PPU_WLOG_CAP - 1)];
+    if (e->frame == frame - 1u && e->line >= kPpuWlogPreRaster) {
+      out[count] = *e;
+      out[count].frame = frame;
+      out[count].line = -1;
+      count++;
+    } else if (e->frame == frame && e->line < kPpuWlogPreRaster) {
+      out[count++] = *e;
+    }
+  }
+  return count;
+}
+
 void ppu_runLine(Ppu* ppu, int line) {
   PPU_T0_DECL
+  /* Writes from here to the next ppu_runLine land on line + 1; no register
+   * write happens inside a line's render. */
+  s_wlog_line = line + 1;
+  s_wlog_line_frame = (uint32_t)snes_frame_counter;
   /* Per-line HDMA state must be captured here, not at end-of-frame: games can
    * rewrite windows and scroll registers before every scanline. */
   debug_server_on_ppu_line(line);
@@ -755,13 +859,17 @@ void ppu_runLine(Ppu* ppu, int line) {
     }
 
     if (ppu->renderFlags & kPpuRenderFlags_NewRenderer) {
+      debug_server_on_ppu_line_drawn(line, 1, ppu->bgmode);
       PPU_T0; PpuDrawWholeLine(ppu, line); PPU_ACC(g_ppu_sec_line_ms);
 #ifdef SNESRECOMP_INTERP_PROFILE
       g_ppu_sec_line_n++;
 #endif
     } else {
+      debug_server_on_ppu_line_drawn(line, 0, ppu->bgmode);
       ppu_draw_whole_line_legacy(ppu, line);
     }
+    if (ppu->mode7Hd.pixels)
+      PpuDrawMode7HdLine(ppu, (unsigned)line);
   }
 }
 
@@ -2048,7 +2156,7 @@ static uint32 PpuHostColor(Ppu *ppu, uint16 pixel, unsigned x) {
     uint32 c = ppu->hostObjColors[x];
     return ((c >> 19) & 31) | (((c >> 11) & 31) << 5) | (((c >> 3) & 31) << 10);
   }
-  return ppu->cgram[pixel & 255];
+  return PpuPixelColor(ppu, pixel, x);
 }
 
 static bool PpuOverlayActiveOnLine(Ppu *ppu, PpuOverlaySource source,
@@ -2432,6 +2540,149 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   PpuWriteOverlayRenderLine(ppu, kPpuOverlaySource_Obj, y);
 }
 
+static bool PpuHdWindowCondition(unsigned mode, bool inside) {
+  return mode == 3 || (mode == 1 && !inside) || (mode == 2 && inside);
+}
+
+/* Resolve colour after HD background sampling and native OBJ priority. An
+ * opaque native BG pixel cannot serve as a mask: a fractional sample may be
+ * transparent and reveal a sprite that the native sample had covered. */
+static uint32_t PpuHdColour(const Ppu *ppu, uint16_t main, uint16_t sub,
+                            bool inside, size_t x) {
+  unsigned layer = (main >> 8) & 15;
+  unsigned colour = PpuPixelColor(ppu,main,x);
+  bool clip = PpuHdWindowCondition(PPU_clipMode(ppu), inside);
+  bool math = !PpuHdWindowCondition(PPU_preventMathMode(ppu), inside) &&
+      (PPU_mathEnabled(ppu) & (1u << layer));
+  unsigned other = ppu->fixedColor;
+  bool half = math && PPU_halfColor(ppu);
+  if (math && PPU_addSubscreen(ppu)) {
+    if (sub & 255) other = PpuPixelColor(ppu,sub,x);
+    else half = false;
+  }
+  uint32_t output = 0;
+  for (unsigned c = 0; c < 3; ++c) {
+    int value = clip ? 0 : (colour >> (5 * c)) & 31;
+    if (math) {
+      int second = (other >> (5 * c)) & 31;
+      value += PPU_subtractColor(ppu) ? -second : second;
+      if (value < 0) value = 0;
+      if (half) value /= 2;
+      if (value > 31) value = 31;
+    }
+    output |= (uint32_t)ppu->brightnessMult[value] << (16 - 8 * c);
+  }
+  return output;
+}
+
+static void PpuHdMarkWindow(uint8_t visibility[kPpuBufWidth],
+                            const PpuWindows *window, uint8_t bit,
+                            bool mark_inside) {
+  for (unsigned span = 0; span < window->nr; ++span) {
+    bool inside = (window->bits & (1u << span)) != 0;
+    if (inside != mark_inside) continue;
+    for (int x = window->edges[span]; x < window->edges[span + 1]; ++x)
+      visibility[x + kPpuExtraLeftRight] |= bit;
+  }
+}
+
+static void PpuDrawMode7HdLine(Ppu *ppu, unsigned line) {
+  const PpuMode7HdSurface *surface = &ppu->mode7Hd;
+  if (!line || line > surface->height) return;
+  const unsigned width = surface->width, scale = surface->scale;
+  uint8_t *first = (uint8_t *)surface->pixels +
+      (line - 1) * scale * surface->pitch;
+  /* A host changing viewports must rebind. Clear instead of reading beyond
+   * the native scanout or leaving an old scene visible in this surface. */
+  if (!ppu->renderBuffer || width != 256u + 2u * ppu->extraLeftRight ||
+      ppu->renderPitch < width * sizeof(uint32_t)) {
+    for (unsigned sy = 0; sy < scale; ++sy)
+      memset(first + sy * surface->pitch, 0, width * scale * sizeof(uint32_t));
+    return;
+  }
+  bool hd = scale > 1 && PPU_mode(ppu) == 7 &&
+      !PPU_forcedBlank(ppu) && !PPU_m7extBg(ppu) &&
+      !PPU_directColor(ppu) && !PPU_interlace(ppu) &&
+      !PPU_pseudoHires(ppu) &&
+      !(PPU_mosaicEnabled(ppu, 0) && PPU_mosaicSize(ppu) > 1) &&
+      !ppu->widescreenLineEnhancer && !(ppu->wsHudSplitHeight & 0x80);
+  /* An independently promoted surface is composed by the host. Keep those
+   * pixels identical until that host also opts into HD overlay composition. */
+  for (unsigned source = 0; hd && source < kPpuOverlaySource_Count; ++source)
+    if (PpuOverlayActiveOnLine(ppu, (PpuOverlaySource)source, (int)line - 1))
+      hd = false;
+  if (!hd) {
+    const uint32_t *native = (const uint32_t *)(ppu->renderBuffer +
+        (line - 1) * ppu->renderPitch);
+    uint32_t *row = (uint32_t *)first;
+    for (unsigned x = 0; x < width; ++x)
+      for (unsigned sx = 0; sx < scale; ++sx) row[x * scale + sx] = native[x];
+    for (unsigned sy = 1; sy < scale; ++sy)
+      memcpy(first + sy * surface->pitch, first, width * scale * sizeof(uint32_t));
+    return;
+  }
+
+  uint8_t visibility[kPpuBufWidth] = {0};
+  PpuWindows window;
+  for (unsigned sub = 0; sub < 2; ++sub) {
+    for (unsigned object = 0; object < 2; ++object) {
+      unsigned layer = object ? 4 : 0;
+      if (!IS_SCREEN_ENABLED(ppu, sub, layer)) continue;
+      if (IS_SCREEN_WINDOWED(ppu, sub, layer))
+        PpuWindows_Calc(&window, ppu, layer, (int)line);
+      else
+        PpuWindows_Clear(&window, ppu, layer, (int)line);
+      PpuHdMarkWindow(visibility, &window, (uint8_t)(1u << (sub + 2 * object)), false);
+    }
+  }
+  PpuWindows_Calc(&window, ppu, 5, (int)line);
+  PpuHdMarkWindow(visibility, &window, 16, true);
+  SnesMode7HdTransform transform =
+      SnesMode7HdMakeTransform(ppu->m7matrix, ppu->m7sel, line);
+  const uint16_t *vram = PpuRenderVram(ppu);
+  double offsets[4]; /* The surface binding accepts scales 1..4. */
+  for (unsigned sx = 0; sx < scale; ++sx) offsets[sx] = (double)sx / scale;
+  for (unsigned sy = 0; sy < scale; ++sy) {
+    uint32_t *row = (uint32_t *)(first + sy * surface->pitch);
+    memset(row, 0, width * scale * sizeof(uint32_t));
+    double subline = (double)sy / scale;
+    double left = -(int)ppu->extraLeftCur, right = 256 + ppu->extraRightCur;
+    double dy_x = subline * transform.row_x, dy_y = subline * transform.row_y;
+    bool bounded = SnesMode7HdSpanFits(
+        transform.origin_x + left * transform.step_x + dy_x,
+        transform.origin_y + left * transform.step_y + dy_y,
+        transform.origin_x + right * transform.step_x + dy_x,
+        transform.origin_y + right * transform.step_y + dy_y, INT_MAX);
+    int last_x = INT_MIN, last_y = INT_MIN;
+    uint8_t index = 0;
+    for (int x = -(int)ppu->extraLeftCur; x < 256 + ppu->extraRightCur; ++x) {
+      unsigned i = (unsigned)(x + kPpuExtraLeftRight);
+      uint8_t visible = visibility[i];
+      uint16_t object = ppu->objBuffer.data[i];
+      for (unsigned sx = 0; sx < scale; ++sx) {
+        double position = x + offsets[sx];
+        if (bounded) {
+          int tx = SnesMode7HdFloorInt(transform.origin_x + position * transform.step_x + dy_x);
+          int ty = SnesMode7HdFloorInt(transform.origin_y + position * transform.step_y + dy_y);
+          if (tx != last_x || ty != last_y) {
+            index = SnesMode7HdFetchInt(transform.control, vram, tx, ty, -1);
+            last_x = tx; last_y = ty;
+          }
+        } else {
+          index = SnesMode7HdSample(&transform, vram, position, subline);
+        }
+        uint16_t bg = index ? (uint16_t)(0x5000 | index) : 0x0500;
+        uint16_t main = visible & 1 ? bg : 0x0500;
+        uint16_t sub = visible & 2 ? bg : 0x0500;
+        if ((visible & 4) && object > main) main = object;
+        if ((visible & 8) && object > sub) sub = object;
+        row[(x + ppu->extraLeftRight) * scale + sx] =
+            PpuHdColour(ppu, main, sub, (visible & 16) != 0, i);
+      }
+    }
+  }
+}
+
 static bool PpuWidescreenHudOamSlot(Ppu *ppu, uint8_t index, uint8_t y) {
   uint8_t slot = index >> 1;
   bool hud_y = ppu->wsHudOamHeight &&
@@ -2493,19 +2744,60 @@ static void PpuWsOamHistoryMarkSeen(Ppu *ppu, uint8_t slot) {
   ppu->wsOamMotionSeen[slot >> 3] |= (uint8_t)(1u << (slot & 7));
 }
 
+/* Once per FRAME, and a repeated line is not a new frame.
+ *
+ * The guard used to skip only when the line number ADVANCED, so an equal
+ * line number read as a frame boundary. That holds for a host that renders
+ * each line once. A host that re-renders lines into scratch surfaces -- to
+ * isolate the backgrounds, or the OBJ layer, for a widescreen compositor --
+ * arrives a second time with line == lastLine, which the old test took for a
+ * wrap. The body then ran on the order of once per line.
+ *
+ * That is fatal to a classifier built on per-frame deltas. OAM does not
+ * change between two passes over the same line, so every repeat saw dx == 0:
+ * the first pass set the grace and the repeats decremented it straight back
+ * to zero. Measured on SimCity's city view, which re-renders every line for
+ * its margin passes: the longest unbroken stretch of frames on which ANY
+ * slot held motion grace was 1, against 68 once this is keyed correctly.
+ * A moving sprite needs grace on every frame to stay drawn in a margin, so
+ * at 1 no game-authored object could ever hold one -- reported from play as
+ * the train missing from the widescreen margins.
+ *
+ * A real frame boundary is the line number going BACKWARDS, which a repeated
+ * line never does. line == 0 is accepted too, for hosts that pass it, with
+ * lastLine != 0 so a repeat there cannot double-run either. Hosts that render
+ * the field as lines 1..224 and never pass line 0 still wrap 224 -> 1.
+ *
+ * Deliberately not keyed on snes_frame_counter: RtlRunFrame owns that, and a
+ * host driving the PPU directly never calls it, which freezes the classifier
+ * outright -- tried, and it left the grace at zero for the whole run. */
 static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line) {
-  if (ppu->wsOamMotionLastLine >= 0 && line > ppu->wsOamMotionLastLine) {
-    ppu->wsOamMotionLastLine = (int16_t)line;
-    return;
-  }
+  const int last = ppu->wsOamMotionLastLine;
+  const bool new_frame = last < 0 || line < last || (line == 0 && last != 0);
   ppu->wsOamMotionLastLine = (int16_t)line;
+  if (!new_frame)
+    return;
   for (uint8_t slot = 0; slot < 128; slot++) {
     uint8_t index = (uint8_t)(slot * 2);
     int16_t x = (int16_t)PpuDecodeOamX(ppu, index);
     uint32_t sig = PpuOamMotionSignature(ppu, index);
     if (PpuWsOamHistorySeen(ppu, slot) &&
         sig == ppu->wsOamMotionSig[slot]) {
-      if (x != ppu->wsOamMotionX[slot]) {
+      /* A STEP, not a teleport.
+       *
+       * "X changed" is too weak a test for movement. SimCity's scenario
+       * selector blinks a selection bracket by flipping it between an
+       * on-screen position and one 256 px to the left, which hardware
+       * clips and a widened margin does not. Every toggle looks like
+       * motion, so the grace never expires and the bracket sits in the
+       * margin blinking -- measured as 128 stray green pixels there.
+       *
+       * Real movement is small and per-frame: the title sign this
+       * classifier exists for travels about 2 px a frame. A jump of a
+       * whole screen is a game hiding something, not an object moving,
+       * so it must not refresh the grace. */
+      const int dx = x - ppu->wsOamMotionX[slot];
+      if (dx != 0 && dx > -32 && dx < 32) {
         ppu->wsOamMotionGrace[slot] = kPpuWsOamMovingGraceFrames;
       } else if (ppu->wsOamMotionGrace[slot]) {
         ppu->wsOamMotionGrace[slot]--;
@@ -2528,10 +2820,42 @@ static bool PpuWidescreenOamLeftHintAllows(Ppu *ppu, uint8_t index, int x,
   int slot = index >> 1;
   if (ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7)))
     return true;
-  return ppu->wsOamMotionGrace[slot] != 0;
+  return ppu->wsOamMotionGraceOn && ppu->wsOamMotionGrace[slot] != 0;
+}
+
+void PpuSetExtraObjects(Ppu *ppu,const PpuExtraObject *objects,size_t count) {
+  ppu->extraObjects=objects;ppu->extraObjectCount=objects?count:0;
+}
+
+bool PpuComposeExtraObjects(const PpuExtraObject *objects,size_t count,
+    int y,int x0,size_t width,unsigned first_slot,
+    uint16_t *depth,uint16_t *colors,uint64_t *order) {
+  bool added=false;
+  for(size_t i=0;i<count;++i) {
+    const PpuExtraObject *o=&objects[i];
+    int64_t row=(int64_t)y-o->y, left=(int64_t)o->x-x0;
+    if(!o->pixels || !o->order || o->priority>3 || o->oamSlot>127 ||
+       o->stride<o->width || row<0 || row>=o->height) continue;
+    int64_t begin=left<0?0:left, end=left+o->width;
+    if(end>(int64_t)width)end=(int64_t)width;
+    uint64_t rank=((uint64_t)((o->oamSlot-first_slot)&127)<<32)|o->order;
+    uint16_t z=(uint16_t)(SPRITE_PRIO_TO_PRIO(o->priority,!o->math)<<8);
+    /* Preserve the legacy renderer's palette-based OBJ math classification. */
+    z|=o->math?0xc0:0x80;
+    for(int64_t x=begin;x<end;++x) {
+      uint16_t color=o->pixels[(size_t)row*o->stride+(size_t)(x-left)];
+      if(!(color&0x8000) || rank>=order[x])continue;
+      depth[x]=z;colors[x]=color;order[x]=rank;added=true;
+    }
+  }
+  return added;
 }
 
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+  if(ppu->extraObjectCount) {
+    memset(ppu->objectColors,0,sizeof(ppu->objectColors));
+    memset(ppu->objectOrder,0xff,sizeof(ppu->objectOrder));
+  }
   static const uint8 spriteSizes[8][2] = {
     {8, 16}, {8, 32}, {8, 64}, {16, 32},
     {16, 64}, {32, 64}, {16, 32}, {16, 32}
@@ -2539,6 +2863,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
 
   // TODO: rectangular sprites, wierdness with sprites at -256
   uint8_t index = PPU_objPriority(ppu) ? (ppu->oamaddl & 0xfe) : 0;
+  unsigned first_slot=index>>1;
   int spritesFound = 0;
   int tilesFound = 0;
   uint8_t foundSprites[128];
@@ -2618,6 +2943,43 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);
             PpuZbufType *dst = ppu->objBuffer.data + col + x + px_left + kPpuExtraLeftRight;
             int slot = index >> 1;
+             /* Clip an unhinted sprite at the SCREEN EDGE, per pixel.
+             *
+             * PpuWidescreenOamLeftHintAllows() gates whole sprites, so a
+             * sprite is drawn entirely or not at all. For an object sliding
+             * off the left that means it pops out in whole-sprite steps --
+             * the title's SimCity sign is three 16 px sprites, so it leaves
+             * in three 16 px chunks instead of sliding.
+             *
+             * Hardware clips at x=0 per pixel. Doing the same here makes the
+             * object leave smoothly and costs nothing elsewhere: a sprite
+             * fully on screen never has a negative pixel, and a host-placed
+             * one is hinted and keeps its margin pixels. */
+            static int ws_edge_clip_on = -1;
+            if (ws_edge_clip_on < 0) {
+              const char *e = getenv("SNESRECOMP_WS_OBJ_EDGE_CLIP");
+              ws_edge_clip_on = (e && *e) ? (*e != '0') : 1;
+            }
+            /* NOT while the sprite is moving.
+             *
+             * PpuWidescreenOamLeftHintAllows() now lets an unhinted OBJ
+             * with motion grace travel into the widened left margin. This
+             * clip then threw away every one of its pixels past x=0, so
+             * the object was admitted and immediately erased -- reported
+             * from play as the title's SimCity sign fading out ON screen
+             * rather than leaving at the true edge. Measured on the title:
+             * with the clip off the sign tracks smoothly from x=56..94
+             * down to x=34..72 across the margin; with it on those pixels
+             * are simply gone.
+             *
+             * It still applies to a sprite that is NOT moving, which is
+             * what it was written for: an unhinted parked object has no
+             * business in the margin, and clipping it at the screen edge
+             * beats popping it out a whole sprite at a time. */
+            const bool ws_clip_left =
+                ws_edge_clip_on && ppu->wsOamLeftHintStrict &&
+                !(ppu->wsOamLeftHint[slot >> 3] & (1u << (slot & 7))) &&
+                !(ppu->wsOamMotionGraceOn && ppu->wsOamMotionGrace[slot]);
             PpuOverlayCapture *obj_capture =
                 &ppu->overlayCaptures[kPpuOverlaySource_Obj];
             bool capture_slot = PpuOverlayActiveOnLine(
@@ -2633,6 +2995,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
         int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 |
                     (bits >> 14) & 4 | (bits >> 21) & 8;
         if (pixel == 0) continue;
+        if (ws_clip_left && col + x + px < 0) continue;
               if (capture_slot) {
                 int screen_x = col + x + px;
                 if (screen_x >= obj_capture->x0 && screen_x < obj_capture->x1) {
@@ -2646,13 +3009,18 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
         // Lower OAM indices are processed later and overwrite higher ones.
                 dst[0] = z + pixel;
                 if (ppu->hostObjPixels) ppu->hostObjOwners[dst - ppu->objBuffer.data] = (uint8)slot;
+                if(ppu->extraObjectCount)
+                  ppu->objectOrder[dst-ppu->objBuffer.data]=(uint64_t)((slot-first_slot)&127)<<32;
             }
         }
         if(tilesFound > 34 &&
            !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits))
       break;
   }
-  return tilesFound != 0;
+  bool extra=ppu->extraObjectCount && PpuComposeExtraObjects(
+      ppu->extraObjects,ppu->extraObjectCount,line,-kPpuExtraLeftRight,
+      kPpuBufWidth,first_slot,ppu->objBuffer.data,ppu->objectColors,ppu->objectOrder);
+  return tilesFound != 0 || extra;
 }
 
 static uint16_t ppu_getVramRemap(Ppu* ppu) {
@@ -2773,121 +3141,164 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
 }
 
 /* ── raster journal ────────────────────────────────────────────────────────
- * Per-line replay of mid-frame PPU writes, for frame-model hosts.
+ * Per-line replay of mid-field PPU writes, for frame-model hosts.
  *
  * Such a host runs the frame's CPU work first and renders all 224 lines
  * afterwards, so the PPU register file at render time is the LAST-written
  * state. A raster-split game turns these registers into per-line waveforms.
  * Gundam Wing's IRQ chain (lines 21/23/71/72/215) writes INIDISP, BG1
- * scroll, TM, TMW and CGADSUB per band: the HUD band at the top has its own
- * scroll and layer set, the playfield another, the letterbox a third.
- * Rendering the whole frame with the final state drew the demo black
- * (measured: 61/61 frames rendered forcedBlank), and with INIDISP-only
- * replay the HUD band drew black while the reference shows the health bars.
+ * scroll, TM, TMW and CGADSUB per band; Doom's (lines 23/199) writes INIDISP
+ * and the window edges ($2126/$2127) that frame its 3D view. Rendering the
+ * whole frame with the final state drew both black.
  *
- * Same defect class the HDMA engine solved (dma_initHdma/dma_doHdma):
- * record during CPU time, replay per line at render time. The host brackets:
- *   ppu_rasterBegin(ppu)              after its vblank-edge work — snapshots
- *                                     line-0 state, including the write-twice
- *                                     scroll latch
- *   ppu_rasterApplyLine(ppu, line)    in the render loop before ppu_runLine
- * The register-write path calls ppu_rasterRecord with the beam line.
+ * Same defect class the HDMA engine solved (dma_initHdma/dma_doHdma): record
+ * during CPU time, replay per line at render time.
  *
- * Registers journaled: the set the split handlers write. Data ports (VRAM/
- * CGRAM/OAM) are deliberately excluded — those are uploads, not per-line
- * display state, and replaying them would double-apply the data. */
+ * Fields, not host frames. The journal is cut by the BEAM: when it reaches
+ * V=225 the field it was recording is complete, its register state at that
+ * instant is the next field's baseline, and recording continues into a new
+ * journal (ppu_rasterFieldBoundary, called from the beam walk). A host frame
+ * may legitimately straddle that point -- Doom's bottom split DMAs the GSU
+ * frame from line 199 through vblank into the next field's top border, so its
+ * CPU half ends well past V=225 -- and when it was cut at the host's frame
+ * start instead, the writes made after the crossing were filed under the
+ * field that had just ended, at lines it had already drawn.
+ *
+ * Every display register is journaled: $2100-$2133 except the data ports and
+ * their address registers (VRAM $2115-$2119, CGRAM $2121/$2122, OAMDATA
+ * $2104), which are uploads rather than per-line display state, plus HDMAEN
+ * ($420C), which is handed back to the host because HDMA lives in the DMA
+ * unit. The set used to be the five registers one title's handlers wrote;
+ * the next title wrote a sixth and drew black.
+ *
+ * Writes the render walk makes itself (its HDMA, and this replay) are not
+ * journaled: they are the field being reconstructed, not new history. HDMA
+ * the beam performs during the CPU half (a host that leaves beam HDMA on) is
+ * history and is journaled.
+ *
+ * Host contract:
+ *   ppu_rasterBegin(ppu)            arm (idempotent; hosts call it per frame)
+ *   ppu_rasterRenderBegin(ppu)      before the render loop: restore the last
+ *                                   completed field's baseline
+ *   ppu_rasterApplyLine(ppu, line)  in the render loop, before ppu_runLine
+ *   ppu_rasterRenderEnd(ppu)        after it: reapply the writes made since
+ *                                   the field ended, so the guest resumes
+ *                                   with the register file it last wrote */
 int g_ppu_scanout_latch_bypass = 0;
 
-#define PPU_RASTER_MAX 256
-typedef struct { uint8_t line; uint16_t reg; uint8_t val; } PpuRasterEntry;
-static PpuRasterEntry s_raster[PPU_RASTER_MAX];
-static int s_raster_count;
+static PpuVramWriteLogHook s_vram_write_log_hook;
+
+void ppu_set_vram_write_log_hook(PpuVramWriteLogHook hook) {
+  s_vram_write_log_hook = hook;
+}
+
+#define PPU_RASTER_MAX 4096
+/* key: beam position within the field, monotonic from its start at V=225
+ * (0) through vblank (36 = V=261) and the visible lines (37 = V=0 ...). */
+typedef struct { uint16_t key; uint16_t reg; uint8_t val; } PpuRasterEntry;
+typedef struct {
+  uint8_t regs[PPU_SAVESTATE_REGS_SIZE];   /* inidisp..cgwsel at field start */
+  uint8_t scrollPrev, scrollPrev2, m7prev;
+  uint8_t hdmaen;
+  int count;
+  uint32_t dropped;
+  PpuRasterEntry e[PPU_RASTER_MAX];
+} PpuRasterField;
+static PpuRasterField s_field[2];
+static int s_raster_cur;             /* recording; the other is completed */
 static int s_raster_armed;
+static int s_raster_have_completed;
+static int s_raster_rendering;
+static const PpuRasterField *s_raster_render;
 static int s_raster_next;
 static uint8_t s_raster_hdmaen;
 static int s_raster_hdmaen_pending;
 static struct {
-  uint8_t inidisp;
-  uint16_t hScroll0, vScroll0;
-  uint8_t tm, tmw, cgadsub, hdmaen;
-  uint8_t scrollPrev, scrollPrev2;
-} s_raster0;
+  uint8_t oamAdr, oamInHigh, oamSecondWrite, oamBuffer;
+} s_raster_port;
+
+/* Only the machine's PPU journals: the debug server and a few tools run
+ * ppu_write on scratch copies. */
+static Ppu *raster_machine_ppu(void) {
+  return g_snes ? g_snes->ppu : NULL;
+}
+
+static uint16_t raster_key(uint16_t line) {
+  return (uint16_t)(line >= 225 ? line - 225 : line + (262 - 225));
+}
 
 static int raster_reg_journaled(uint16_t reg) {
+  if (reg == 0x420C)
+    return 1;
+  if (reg < 0x2100 || reg > 0x2133)
+    return 0;
   switch (reg) {
-    case 0x2100:                 /* INIDISP */
-    case 0x210D: case 0x210E:    /* BG1HOFS / BG1VOFS */
-    case 0x212C: case 0x212E:    /* TM / TMW */
-    case 0x2131:                 /* CGADSUB */
-    /* HDMAEN is a per-line fact as much as any PPU register. This title
-     * enables the transition's HDMA channels MID-FRAME from the line-21 raster
-     * handler ($00:888E writes $420C = 0x90, channels 4 and 7, channel 7
-     * driving $2128 = window 2 left for the shutter wipe). A frame-model host
-     * that reads the enable mask once at render time sees only the end-of-frame
-     * value, so a channel switched on at line 21 and off again later never runs
-     * at all — measured, the whole wipe was missing while the NMI-enabled
-     * letterbox on channel 1 rendered fine. */
-    case 0x420C:
-      return 1;
-    default:
+    case 0x2104:                                       /* OAMDATA */
+    case 0x2115: case 0x2116: case 0x2117:             /* VRAM port */
+    case 0x2118: case 0x2119:
+    case 0x2121: case 0x2122:                          /* CGRAM port */
       return 0;
+    default:
+      return 1;
   }
+}
+
+static void raster_snapshot(PpuRasterField *f, const Ppu *ppu) {
+  memcpy(f->regs, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
+  f->scrollPrev = ppu->scrollPrev;
+  f->scrollPrev2 = ppu->scrollPrev2;
+  f->m7prev = ppu->m7prev;
+  f->hdmaen = g_snesrecomp_last_hdmaen;
+  f->count = 0;
+  f->dropped = 0;
 }
 
 void ppu_rasterBegin(Ppu *ppu) {
-  s_raster_count = 0;
-  s_raster_next = 0;
+  /* A host that renders has finished with the previous field's replay. */
+  s_raster_rendering = 0;
+  if (s_raster_armed)
+    return;
   s_raster_armed = 1;
-  s_raster0.inidisp = ppu->inidisp;      /* post-vblank state = line-0 state */
-  s_raster0.hScroll0 = ppu->hScroll[0];
-  s_raster0.vScroll0 = ppu->vScroll[0];
-  s_raster0.tm = ppu->screenEnabled[0];
-  s_raster0.tmw = ppu->screenWindowed[0];
-  s_raster0.cgadsub = ppu->cgadsub;
-  s_raster0.hdmaen = g_snesrecomp_last_hdmaen;
-  s_raster0.scrollPrev = ppu->scrollPrev;
-  s_raster0.scrollPrev2 = ppu->scrollPrev2;
+  s_raster_cur = 0;
+  s_raster_have_completed = 0;
+  raster_snapshot(&s_field[0], ppu);
+}
+
+void ppu_rasterFieldBoundary(void) {
+  Ppu *ppu = raster_machine_ppu();
+  if (!s_raster_armed || !ppu)
+    return;
+  s_raster_rendering = 0;
+  s_raster_cur ^= 1;
+  s_raster_have_completed = 1;
+  raster_snapshot(&s_field[s_raster_cur], ppu);
+}
+
+void ppu_rasterReset(void) {
+  s_raster_armed = 0;
+  s_raster_have_completed = 0;
+  s_raster_rendering = 0;
+  s_raster_render = NULL;
+  s_raster_hdmaen_pending = 0;
 }
 
 void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val) {
-  if (!s_raster_armed || !raster_reg_journaled(reg)) return;
-  if (line == 0 || line >= 225) {
-    /* A write outside active display is next frame's baseline, not a split.
-     * Track it in the snapshot so late-vblank writes are not lost. */
-    switch (reg) {
-      case 0x2100: s_raster0.inidisp = val; break;
-      case 0x210D:
-        s_raster0.hScroll0 =
-            (uint16_t)((val << 8 | s_raster0.scrollPrev) & 0x3FF);
-        s_raster0.scrollPrev = val;
-        s_raster0.scrollPrev2 = val;
-        break;
-      case 0x210E:
-        s_raster0.vScroll0 =
-            (uint16_t)((val << 8 | s_raster0.scrollPrev) & 0x3FF);
-        s_raster0.scrollPrev = val;
-        break;
-      case 0x212C: s_raster0.tm = val; break;
-      case 0x212E: s_raster0.tmw = val; break;
-      case 0x2131: s_raster0.cgadsub = val; break;
-      case 0x420C: s_raster0.hdmaen = val; break;
-    }
+  PpuRasterField *f;
+  if (!s_raster_armed || s_raster_rendering || !raster_reg_journaled(reg))
+    return;
+  if (g_ppu_wlog_src == kPpuWlogReplay)
+    return;
+  f = &s_field[s_raster_cur];
+  if (f->count >= PPU_RASTER_MAX) {
+    f->dropped++;
     return;
   }
-  if (s_raster_count < PPU_RASTER_MAX) {
-    s_raster[s_raster_count].line = (uint8_t)line;
-    s_raster[s_raster_count].reg = reg;
-    s_raster[s_raster_count].val = val;
-    s_raster_count++;
-  }
+  f->e[f->count].key = raster_key(line);
+  f->e[f->count].reg = reg;
+  f->e[f->count].val = val;
+  f->count++;
 }
 
-/* Restore the line-0 snapshot. Called by the host BEFORE its render loop —
- * i.e. before dma_initHdma and the first dma_doHdma — never inside line 1:
- * HDMA writes the same registers per line (this title's intro letterbox is an
- * HDMA stream onto TM), and a restore after line 1's HDMA write would stomp
- * it. Measured as exactly that regression: the intro's top black bar
- * disappeared while the HDMA bars below survived. */
 int ppu_rasterTakeHdmaen(uint8_t *out) {
   if (!s_raster_hdmaen_pending) return 0;
   s_raster_hdmaen_pending = 0;
@@ -2895,58 +3306,51 @@ int ppu_rasterTakeHdmaen(uint8_t *out) {
   return 1;
 }
 
+/* Restore the baseline of the last completed field. Called BEFORE the render
+ * loop -- i.e. before dma_initHdma and the first dma_doHdma -- never inside
+ * line 1: HDMA writes the same registers per line, and a restore after line
+ * 1's HDMA write would stomp it. */
 void ppu_rasterRenderBegin(Ppu *ppu) {
+  const PpuRasterField *f;
   if (!s_raster_armed) return;
-  s_raster_hdmaen_pending = 0;
-  ppu->inidisp = s_raster0.inidisp;
-  ppu->hScroll[0] = s_raster0.hScroll0;
-  ppu->vScroll[0] = s_raster0.vScroll0;
-  ppu->screenEnabled[0] = s_raster0.tm;
-  ppu->screenWindowed[0] = s_raster0.tmw;
-  ppu->cgadsub = s_raster0.cgadsub;
-  ppu->scrollPrev = s_raster0.scrollPrev;
-  ppu->scrollPrev2 = s_raster0.scrollPrev2;
+  /* Before any field has completed (the first frame), the recording one is
+   * all there is. */
+  f = s_raster_have_completed ? &s_field[s_raster_cur ^ 1]
+                              : &s_field[s_raster_cur];
+  s_raster_port.oamAdr = ppu->oamAdr;
+  s_raster_port.oamInHigh = ppu->oamInHigh;
+  s_raster_port.oamSecondWrite = ppu->oamSecondWrite;
+  s_raster_port.oamBuffer = ppu->oamBuffer;
+  memcpy(&ppu->inidisp, f->regs, PPU_SAVESTATE_REGS_SIZE);
+  ppu->scrollPrev = f->scrollPrev;
+  ppu->scrollPrev2 = f->scrollPrev2;
+  ppu->m7prev = f->m7prev;
+  s_raster_render = f;
   s_raster_next = 0;
+  s_raster_hdmaen_pending = 0;
+  s_raster_rendering = 1;
 }
 
-/* Snapshot of the journal as the renderer will consume it, for the debug
- * server. The journal is the difference between "what the game wrote" and
- * "what got drawn", so when a frame looks wrong this is the only place the two
- * can be compared. Format: one "line:reg=val" token per entry, in beam order,
- * preceded by the line-0 baseline. */
-int ppu_rasterDebugDump(char *out, int cap) {
-  int pos = 0;
-  int i;
-  pos += snprintf(out + pos, cap - pos,
-                  "{\"count\":%d,\"armed\":%d,"
-                  "\"base\":{\"inidisp\":\"0x%02X\",\"tm\":\"0x%02X\","
-                  "\"tmw\":\"0x%02X\",\"cgadsub\":\"0x%02X\","
-                  "\"bg1h\":%u,\"bg1v\":%u},\"entries\":[",
-                  s_raster_count, s_raster_armed,
-                  s_raster0.inidisp, s_raster0.tm, s_raster0.tmw,
-                  s_raster0.cgadsub,
-                  (unsigned)s_raster0.hScroll0, (unsigned)s_raster0.vScroll0);
-  for (i = 0; i < s_raster_count && pos < cap - 64; i++) {
-    pos += snprintf(out + pos, cap - pos, "%s{\"l\":%u,\"r\":\"0x%04X\",\"v\":\"0x%02X\"}",
-                    i ? "," : "", (unsigned)s_raster[i].line,
-                    s_raster[i].reg, s_raster[i].val);
-  }
-  pos += snprintf(out + pos, cap - pos, "]}");
-  return pos;
+static void raster_replay(Ppu *ppu, uint16_t reg, uint8_t val) {
+  const uint8_t saved_src = g_ppu_wlog_src;
+  g_ppu_wlog_src = kPpuWlogReplay;
+  ppu_write(ppu, (uint8_t)(reg & 0xFF), val);
+  g_ppu_wlog_src = saved_src;
 }
 
 void ppu_rasterApplyLine(Ppu *ppu, int line) {
-  if (!s_raster_armed) return;
-  /* Entries are appended in beam order (the host walks the beam forward), so
-   * a moving cursor is enough. A write at line L lands mid-line on hardware;
-   * whole-line granularity applies it from line L on. Replaying through
-   * ppu_write keeps the write-twice scroll latch semantics — the latch state
-   * was restored above to its frame-start value, and the handlers write the
-   * two bytes in pairs, so the pairing reproduces exactly. */
-  while (s_raster_next < s_raster_count &&
-         s_raster[s_raster_next].line <= (uint8_t)line) {
-    const uint16_t reg = s_raster[s_raster_next].reg;
-    const uint8_t val = s_raster[s_raster_next].val;
+  const PpuRasterField *f = s_raster_render;
+  uint16_t limit;
+  if (!s_raster_armed || !f || line < 0) return;
+  limit = raster_key((uint16_t)line);
+  /* Entries are in beam order within a field, so a moving cursor is enough.
+   * A write at line L lands mid-line on hardware; whole-line granularity
+   * applies it from the line the host names on. Replaying through ppu_write
+   * keeps the write-twice latch semantics: the latches were restored to the
+   * field's start, and handlers write the two bytes in pairs. */
+  while (s_raster_next < f->count && f->e[s_raster_next].key <= limit) {
+    const uint16_t reg = f->e[s_raster_next].reg;
+    const uint8_t val = f->e[s_raster_next].val;
     if (reg == 0x420C) {
       /* Not ours to apply — HDMA lives in the DMA unit and enabling a channel
        * mid-frame also has to (re)start its table. Hand it to the host, which
@@ -2954,13 +3358,90 @@ void ppu_rasterApplyLine(Ppu *ppu, int line) {
       s_raster_hdmaen = val;
       s_raster_hdmaen_pending = 1;
     } else {
-      ppu_write(ppu, (uint8_t)(reg & 0xFF), val);
+      raster_replay(ppu, reg, val);
     }
     s_raster_next++;
   }
 }
 
+/* The render reconstructed the completed field. Writes the guest has made
+ * since that field ended -- a CPU half that ran past V=225 -- are still in
+ * the recording journal: put them back, so the guest resumes with the
+ * register file it last wrote. The OAM port is the guest's, not display
+ * state: an OAMADD replay must not move it. */
+void ppu_rasterRenderEnd(Ppu *ppu) {
+  const PpuRasterField *f;
+  int i;
+  if (!s_raster_armed || !s_raster_rendering) return;
+  s_raster_rendering = 0;
+  if (s_raster_have_completed) {
+    f = &s_field[s_raster_cur];
+    for (i = 0; i < f->count; i++)
+      if (f->e[i].reg != 0x420C)
+        raster_replay(ppu, f->e[i].reg, f->e[i].val);
+  }
+  ppu->oamAdr = s_raster_port.oamAdr;
+  ppu->oamInHigh = s_raster_port.oamInHigh;
+  ppu->oamSecondWrite = s_raster_port.oamSecondWrite;
+  ppu->oamBuffer = s_raster_port.oamBuffer;
+}
+
+/* Snapshot of the journal as the renderer will consume it, for the debug
+ * server. The journal is the difference between "what the game wrote" and
+ * "what got drawn", so when a frame looks wrong this is the only place the two
+ * can be compared. Lines are beam lines (225..261 = the vblank before the
+ * field's line 0). */
+static int raster_dump_field(char *out, int cap, const char *name,
+                             const PpuRasterField *f) {
+  int pos = 0;
+  int i;
+#define RJ_OFF(field) (offsetof(Ppu, field) - offsetof(Ppu, inidisp))
+  uint16_t bg1h, bg1v;
+  memcpy(&bg1h, f->regs + RJ_OFF(hScroll), sizeof(bg1h));
+  memcpy(&bg1v, f->regs + RJ_OFF(vScroll), sizeof(bg1v));
+  pos += snprintf(out + pos, cap - pos,
+                  "\"%s\":{\"count\":%d,\"dropped\":%u,"
+                  "\"base\":{\"inidisp\":\"0x%02X\",\"tm\":\"0x%02X\","
+                  "\"tmw\":\"0x%02X\",\"cgadsub\":\"0x%02X\","
+                  "\"bg1h\":%u,\"bg1v\":%u},\"entries\":[",
+                  name, f->count, (unsigned)f->dropped,
+                  f->regs[RJ_OFF(inidisp)], f->regs[RJ_OFF(screenEnabled)],
+                  f->regs[RJ_OFF(screenWindowed)], f->regs[RJ_OFF(cgadsub)],
+                  (unsigned)bg1h, (unsigned)bg1v);
+#undef RJ_OFF
+  for (i = 0; i < f->count && pos < cap - 64; i++) {
+    const unsigned key = f->e[i].key;
+    const unsigned line = key < (262 - 225) ? key + 225 : key - (262 - 225);
+    pos += snprintf(out + pos, cap - pos,
+                    "%s{\"l\":%u,\"r\":\"0x%04X\",\"v\":\"0x%02X\"}",
+                    i ? "," : "", line, f->e[i].reg, f->e[i].val);
+  }
+  pos += snprintf(out + pos, cap - pos, "]}");
+  return pos;
+}
+
+int ppu_rasterDebugDump(char *out, int cap) {
+  int pos = snprintf(out, cap, "{\"armed\":%d,\"have_completed\":%d,",
+                     s_raster_armed, s_raster_have_completed);
+  /* Raw entries are ~45 bytes each; a field near the cap would not fit. */
+  int half = (cap - pos - 8) / 2;
+  if (half < 128) return pos;
+  pos += raster_dump_field(out + pos, half, "completed",
+                           &s_field[s_raster_cur ^ 1]);
+  pos += snprintf(out + pos, cap - pos, ",");
+  pos += raster_dump_field(out + pos, cap - pos - 2, "recording",
+                           &s_field[s_raster_cur]);
+  pos += snprintf(out + pos, cap - pos, "}");
+  return pos;
+}
+
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+  ppu_wlog_note(adr, val);
+  /* Every path into the PPU -- CPU stores, DMA, beam HDMA -- is history the
+   * raster journal must see; recording here rather than in one caller is
+   * what makes that true. */
+  if (ppu == raster_machine_ppu())
+    ppu_rasterRecord((uint16_t)(0x2100u | adr), g_snes->vPos, val);
 //  if (adr != 24 && adr != 25)
 //    printf("ppu_write(%d, %d)\n", adr, val);
   switch(adr) {
@@ -2986,6 +3467,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       if(ppu->oamInHigh) {
         int hidx = ((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite;
         ppu->highOam[hidx] = val;
+        ppu->oamWriteCount++;
         debug_server_on_oam_write(1, (uint16_t)hidx, (uint16_t)val);
         if(ppu->oamSecondWrite) {
           ppu->oamAdr++;
@@ -2998,6 +3480,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
           uint16_t widx = ppu->oamAdr;
           uint16_t word = (uint16_t)((val << 8) | ppu->oamBuffer);
           ppu->oam[ppu->oamAdr++] = word;
+          ppu->oamWriteCount++;
           debug_server_on_oam_write(0, widx, word);
           if(ppu->oamAdr == 0) ppu->oamInHigh = true;
         }
@@ -3076,8 +3559,11 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       // TODO: vram access during rendering (also cgram and oam)
       uint16_t vramAdr = ppu_getVramRemap(ppu);
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
+      ppu->vramWriteCount++;
       // $2118 == low byte of word; byte_addr = word << 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1), val);
+      if (s_vram_write_log_hook)
+        s_vram_write_log_hook(((uint32_t)(vramAdr & 0x7fff) << 1), val);
 #if SNESRECOMP_ENABLE_MODS
       snes_text_xlate_on_vram_write_c((uint16_t)(vramAdr & 0x7fff));
 #endif
@@ -3089,8 +3575,11 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
     case 0x19: {
       uint16_t vramAdr = ppu_getVramRemap(ppu);
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
+      ppu->vramWriteCount++;
       // $2119 == high byte of word; byte_addr = (word << 1) + 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
+      if (s_vram_write_log_hook)
+        s_vram_write_log_hook(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
 #if SNESRECOMP_ENABLE_MODS
       snes_text_xlate_on_vram_write_c((uint16_t)(vramAdr & 0x7fff));
 #endif

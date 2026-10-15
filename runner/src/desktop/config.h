@@ -7,6 +7,10 @@
 #include "sdl_compat.h"
 #include "display_aspect.h"
 
+/* Controller seats the desktop host can drive: two console ports, or up to
+ * eight with a Super Multitap in each (docs/MULTITAP.md). */
+#define kSnesHostPadSeats 8
+
 enum {
   kKeys_Null,
   kKeys_Controls,
@@ -41,6 +45,24 @@ enum {
   /* OpenGL-only framebuffer capture. Kept separate from the diagnostic
    * SNESRECOMP_SCREENSHOT path, which is driven by environment variables. */
   kKeys_Screenshot,
+  /* Reopen the launcher mid-game (SnesDesktopHostGame.in_game_launcher).
+   * Appended for the same reason as SaveStateMenu. */
+  kKeys_OpenLauncher,
+  /* Multitap seats 3..8. Appended so every earlier command keeps its value.
+   * Their keyboard half lives in keybinds.ini like seats 1 and 2; these ids
+   * exist for [GamepadMap] ControlsP3.. and an optional [KeyMap] binding. */
+  kKeys_ControlsP3,
+  kKeys_ControlsP3_Last = kKeys_ControlsP3 + 11,
+  kKeys_ControlsP4,
+  kKeys_ControlsP4_Last = kKeys_ControlsP4 + 11,
+  kKeys_ControlsP5,
+  kKeys_ControlsP5_Last = kKeys_ControlsP5 + 11,
+  kKeys_ControlsP6,
+  kKeys_ControlsP6_Last = kKeys_ControlsP6 + 11,
+  kKeys_ControlsP7,
+  kKeys_ControlsP7_Last = kKeys_ControlsP7 + 11,
+  kKeys_ControlsP8,
+  kKeys_ControlsP8_Last = kKeys_ControlsP8 + 11,
   kKeys_Total,
 };
 
@@ -48,6 +70,15 @@ enum {
   kOutputMethod_SDL,
   kOutputMethod_SDLSoftware,
   kOutputMethod_OpenGL,
+};
+
+/* config.ini [Graphics] VSync. Off and On keep the historical 0/1 spellings so
+ * an existing config.ini reads identically; Adaptive is written as the word,
+ * and maps to a late-swap-tearing interval (-1) where the driver has one. */
+enum {
+  kSnesVSync_Off = 0,
+  kSnesVSync_On = 1,
+  kSnesVSync_Adaptive = 2,
 };
 
 typedef struct Config {
@@ -80,6 +111,8 @@ typedef struct Config {
   // Set from the launcher's dashboard checkbox. Force the launcher back with the
   // --launcher argument or by setting SkipLauncher = 0 in config.ini.
   bool skip_launcher;
+  bool expose_coverage_mod;
+  int coverage_capture; /* -1 absent: use Mods selection */
 
   /* Netplay display name, persisted so the lobby does not prompt on every
    * launch. Framework-owned (config.ini [Netplay] PlayerName) so every SNES
@@ -92,12 +125,21 @@ typedef struct Config {
    * or "none". The host parses it; the SNES pad has no stick buttons, so
    * L3/R3 come from the gamepad itself. */
   char rewind_gesture[64];
+  /* [Controller] LauncherGesture: the same syntax, opening the launcher
+   * mid-game for a host that offers it (default "Select+L3"). */
+  char launcher_gesture[64];
 
   /* Presentation and emulation options the desktop host offers through the
    * launcher's Display page, persisted by WriteConfigFile:
    *   [Graphics] FrameBlend  average each presented frame with the previous
    *                          one (alternate-frame flicker reads as translucency)
-   *   [Graphics] VSync       driver vsync at present time (default on)
+   *   [Graphics] VSync       driver vsync at present time (default on);
+   *                          tri-state, kSnesVSync_* below. The launcher has
+   *                          offered Off/On/Adaptive for as long as the row
+   *                          has existed; this host used to store a bool, so
+   *                          Adaptive silently came back as On on the next
+   *                          launch. Legacy 0/1/true/false spellings still
+   *                          read exactly as before.
    *   [Graphics] Renderer    "auto" (SDL's pick), "opengl" (the native GL
    *                          presenter), "software", or an SDL render driver
    *                          name such as "vulkan"; empty follows OutputMethod
@@ -105,7 +147,16 @@ typedef struct Config {
    * The [Video] / [Emulation] spellings a per-game host used for the same
    * settings are accepted on read. */
   bool frame_blend;
-  bool vsync;
+  uint8 vsync;
+
+  /* config.ini [Rewind], for a host whose descriptor sets rewind_settings.
+   * The ring holds whole-machine snapshots on a frame cadence, so depth and
+   * interval are memory decisions, not cosmetics. Seeded from snes_rewind.c's
+   * own defaults; a port that wants rewind off out of the box ships
+   * `Enabled = 0` in its default_config_ini rather than changing these. */
+  bool rewind_enabled;
+  int rewind_depth;
+  int rewind_interval;
   int run_ahead;
   char renderer[32];
   /* [Sound] Volume, 0..100 (default 100): the mixer level the VolumeUp /
@@ -124,13 +175,13 @@ typedef struct Config {
   char *memory_buffer;
   const char *shader;
 
-  bool enable_gamepad[2];
+  bool enable_gamepad[kSnesHostPadSeats];
   /* Which input device drives each player, from config.ini [Controller]
    * SourceP1/SourceP2 as the launcher writes it: 0 none, 1 keyboard,
    * 2 gamepad. Player 1 defaults to keyboard so a config without the section
    * behaves as it always did; player 2 defaults to none, because a second
    * keyboard player sharing one keyboard has to be asked for. */
-  int player_src[2];
+  int player_src[kSnesHostPadSeats];
   int gamepad_deadzone;
 
   // Which players have keyboard controls
@@ -162,11 +213,18 @@ enum {
 extern Config g_config;
 
 void ConfigUseStateMenuDefaults(void);
+/* Opt in before parsing: binds [KeyMap] OpenLauncher to Ctrl+L by default. */
+void ConfigUseInGameLauncherDefaults(void);
 void ParseConfigFile(const char *filename);
 // Re-apply only the [KeyMap] section (launcher hotkey editor wrote it after
 // the initial parse). Keyboard command map is rebuilt; gamepad map and all
 // scalar settings are left alone.
 void ConfigReloadKeyMap(const char *filename);
+// Re-apply only the [GamepadMap] button bindings (the launcher's controller
+// page wrote them after the initial parse). The gamepad command map is
+// rebuilt; every scalar setting, EnableGamepadN and the deadzone included,
+// keeps its live value.
+void ConfigReloadGamepadMap(const char *filename);
 /* True when ParseConfigFile read a [KeyMap] line that carried a former
  * generated default and mapped it to the current one; WriteConfigFile then
  * rewrites that line. The host writes the file once when this is set. */
@@ -175,6 +233,38 @@ bool ConfigKeyMapMigrated(void);
  * units, 30%) and it was read as the current default instead. The caller
  * rewrites config.ini once so the file says what the game is using. */
 bool ConfigDeadzoneMigrated(void);
+
+/* True when config.ini actually named [Controller] SourceP<player+1>. A file
+ * written before this key existed has not said anything about the player's
+ * device, and the caller falls back to the older EnableGamepadN spelling
+ * rather than to the seeded default. player is 0 or 1. */
+bool ConfigHasPlayerSource(int player);
+
+/* Seats the host routes (2 without a multitap, up to kSnesHostPadSeats).
+ * WriteConfigFile persists EnableGamepadN / SourcePN only for these, so a
+ * two-player title's config.ini keeps exactly its two-seat keys. */
+void ConfigSetPadSeats(int seats);
+int ConfigPadSeats(void);
+
+/* Controller command range of seat `seat` (0-based), or 0 when none. */
+static inline int ConfigSeatControlsBase(int seat) {
+  if (seat == 0) return kKeys_Controls;
+  if (seat == 1) return kKeys_ControlsP2;
+  if (seat >= 2 && seat < kSnesHostPadSeats) return kKeys_ControlsP3 + (seat - 2) * 12;
+  return 0;
+}
+/* Seat (0-based) owning controller command `cmd`, or -1. */
+static inline int ConfigSeatForControl(int cmd) {
+  if (cmd >= kKeys_Controls && cmd <= kKeys_Controls_Last) return 0;
+  if (cmd >= kKeys_ControlsP2 && cmd <= kKeys_ControlsP2_Last) return 1;
+  if (cmd >= kKeys_ControlsP3 && cmd <= kKeys_ControlsP8_Last) return 2 + (cmd - kKeys_ControlsP3) / 12;
+  return -1;
+}
+
+/* Opt in to persisting [Rewind]. A host that does not offer the launcher's
+ * rewind rows never calls this, and WriteConfigFile then leaves whatever the
+ * file says about rewind exactly as it found it. */
+void ConfigEnableRewindKeys(void);
 
 /* Analog stick deadzone, in raw axis units of a 32767 full scale. 10% is the
  * default because it clears a resting stick on the pads players actually own

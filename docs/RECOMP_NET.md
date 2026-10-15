@@ -329,7 +329,41 @@ Rules that matter for SNES recomp hosts:
     `SNESRECOMP_MW_H2H_TOP_BAR=0`.
   - Opt out present: `SNESRECOMP_MW_H2H_FULL_FRAME=0` (half-crop),
     `SNESRECOMP_MW_H2H_LOCAL_VIEW=0` (show split).
-- Savestate / SRAM during netplay is **host-only** (`local_slot == 0`):
+- **Synchronized savestate menu** (Select+R on the host; `snes_netplay_menu_*`):
+  - Only the host drives it. Every peer shows its own copy of the menu; on a
+    guest it is a read-only mirror that follows the host's cursor.
+  - **Open** pauses every peer on the same tick: the host picks
+    `sim + input delay + 16` and sends `HOLD(t)`. Each peer runs to `t` and
+    stops there (rollback: `rnet_rb_driver_set_hold` admits nothing at or past
+    `t` and predicts nothing while held, so `t` is final once reached; the
+    local pad is neutral and unsealed while the menu is up). When every peer
+    has answered `SETTLE`, the host probes the size and CRC of its snapshot at
+    `t`; a guest whose own snapshot differs is sent the host's, and every peer
+    -- the host too -- applies those same bytes. The snapshot is the rollback
+    format (`RtlNetplaySnapshotToMemory`): a plain savestate lacks the timing
+    residue, and a guest given only that kept its own residue and the resumed
+    match refused on the APU digest. The S-DSP output ring (advanced by the
+    audio thread) is blanked while writing and the residue's absolute cycle
+    counters are left out of the CRC (`RtlNetplaySnapshotHashedBytes`), so two
+    peers in one state agree with audio on. Menu saves blank the ring too.
+  - **Save**: every peer writes the slot (and its thumbnail) itself, then the
+    host probes the file's CRC; only a peer whose copy differs is sent the
+    host's slot and thumbnail (`state_drop_peer` removes the matching seats).
+  - **Load**: the slot is probed and sent the same way first; then `LOAD`
+    has every peer apply its own verified copy, and the menu closes.
+  - **Close** sends `RESUME`. If no peer's state was replaced the hold is
+    released and play continues in the same rollback epoch. Otherwise (a
+    load, or a pause state that had to be sent) `RESYNC` first clears every
+    peer's input rings, then `RESUME` primes and restarts the epoch -- in
+    that order, because a peer that cleared after another had primed would
+    erase the primed wires and wait on them forever.
+  - Commands are size-0 probes on slot 255 (`crc = cmd << 28 | arg`), one at a
+    time; every guest replies after acting. A paused match stays connected
+    (validated with 10 s holds).
+  - Test: `tools/test_netplay_desktop.py --savestate-menu` in the MMX port
+    (`--force-mismatch` diverges the guest once so the repair path runs;
+    `--delay-sync`, `--menu-hold-ms`).
+- Hotkey savestate / SRAM during netplay is **host-only** (`local_slot == 0`):
   - **Host** keeps personal files under `saves/` (continuous). Save/load and
     SRAM flush apply **immediately** on the host; the blob is then shipped
     async to the guest (`STATE_*` chunks). Load/SRAM stall admit until the
@@ -367,13 +401,34 @@ if (!snes_lobby_try_fill_launch(&join)) return 0;
 
 ## Engine host scaffold (`snes_host_*`)
 
-Shared MotK + LAN lobby + rematch primitives live in the runner (linked by
-`snesrecomp_enable_recomp_net`). Games should **not** copy lobby callback
+Shared MotK + LAN lobby + rematch primitives are linked by
+`snesrecomp_enable_recomp_net`. Games should **not** copy lobby callback
 tables or soft-return glue.
+
+**Where the lobby lives (lifted 2026-09-25).** The two big pieces are no
+longer SNES code:
+
+| Was | Now | SNES side |
+|-----|-----|-----------|
+| `runner/src/lobby/snes_lobby_client.c` (4,653 lines) + vendored `lobby/ws/` | recomp-net `recomp_net/lobby_client.h`, `src/lobby/rnet_lobby_client.c` (+ its `lobby_ws`) | `snes_lobby_client.{h,c}`: the old names, `SnesLobbyMatchCaps` with its widescreen fields (carried as SNES keys through recomp-net's caps codec), `SNES_NET_` env alias |
+| `runner/src/netplay/snes_host_lobby.c` (2,967 lines) | recomp-ui `src/recomp_netplay_host.h` / `src/netplay/recomp_netplay_host.c` (optional target `recomp_launcher_netplay`) | `snes_host_lobby.c`: identity/opts → hooks, widescreen settlement, the mod runtime as mod hooks, the rollback fork report |
+
+So the port needs a recomp-ui that carries `recomp_target_launcher_netplay()`
+(configure fails naming it otherwise), included before
+`snesrecomp_enable_recomp_net`. The `snes_host_lobby_*` / `snes_lobby_*` API
+the ports call is unchanged. Environment: `RNET_LOBBY_URL` /
+`RNET_LOBBY_GAME_VERSION` are the generic names; `SNES_NET_LOBBY_URL` /
+`SNES_NET_GAME_VERSION` still work (the generic name wins when both are set);
+`RECOMP_NETPLAY_LIST_DEBUG` beside `SNESRECOMP_LOBBY_LIST_DEBUG`.
+
+Known SNES gap, stated where it bites: session slots stay seat-mapped
+(`RECOMP_NETPLAY_SLOTS_SEAT`) because the engine does not read
+`launch.slot_port[]` yet, so a host who moved to seat 1 is session slot 1
+here, not slot 0 as recomp-ui's HOST_NETPLAY.md contract asks.
 
 | API | Role |
 |-----|------|
-| `snes_host_lobby_init` / `snes_host_lobby_callbacks` | MotK WS + LAN file-registry adapter for `RecompLauncherCGameInfo.netplay` |
+| `snes_host_lobby_init` / `snes_host_lobby_callbacks` | SNES adapter over recomp-ui's `recomp_netplay_host` (MotK WS + LAN) for `RecompLauncherCGameInfo.netplay` |
 | `snes_host_lobby_prepare_rematch` / `snes_host_app_begin_soft_return` | Soft-return waiting-room prep |
 | `snes_host_lobby_set_runtime_error` | Waiting-room error string after a failed session |
 | `snes_host_app_apply_launch` | Map `RecompLauncherCNetplayLaunch` → `SnesNetplayConfig` |
@@ -431,7 +486,8 @@ another lobby copy:
 | Self-test AutoLaunch | Optional | `snes_host_lobby_auto_launch` (thin game wrapper OK) |
 
 Do **not** re-copy MotK create/join/`fill_launch` / LAN file-registry glue into
-games — that lives in `snes_host_lobby.c`.
+games — or into engines: it lives in recomp-ui's `recomp_netplay_host.c`, and
+`snes_host_lobby.c` is the SNES adapter over it.
 
 ## Layering policy (prefer engine / UI over game trees)
 
@@ -522,6 +578,27 @@ Connect-wait time lives in `snes_netplay_connect_timed_out` and is reset on
 `snes_netplay_start` / `shutdown` / soft-exit. Games must **not** keep a
 `static` wait clock across rematch — that caused instant false
 `connect_timeout_lan` after Escape → soft-return → Play.
+
+### 2a. A refused match soft-returns the same way
+
+The rollback driver refuses a match whose peers did not boot the same
+(`boot_digest_mismatch`) or do not run the same mods (`mod_set_mismatch`,
+`mod_set_not_agreed`). It then admits no further tick and raises the
+return-to-lobby request with the session still up. `snes_host_barrier_admit`
+is the consumer: it logs `snes_netplay: match refused (<code>) at sim=N`,
+puts the code in the launcher's `last_error` (`snes_host_lobby_set_runtime_error`)
+and takes the same soft exit as a peer leaving, so `*running` drops to 0 and a
+lobby match comes back to the waiting room. A host that pumps admission
+through `snes_host_barrier_admit` needs nothing more; one that polls
+`snes_netplay_poll_admit` itself must check `snes_netplay_return_to_lobby_requested()`
+while `snes_netplay_active()` and leave, reading `snes_netplay_refusal()`
+first. Until 2026-09-25 nothing in the runner read the request: the desktop
+host's loop (`host_main.c`) never checks it, so by reading it plays a refused
+match on (not run -- no desktop-host port here builds netplay), and only game
+hosts that had copied the check (Gundam, Metal Warriors `main.c`) left, without
+saying why. Proven two-process on Gundam with `SNES_RB_FORCE_BOOT_FORK=1` and
+`SNES_RB_FORCE_MOD_MISMATCH=1` on one peer: both peers log the refusal and
+leave within ~0.7 s of the second one starting.
 
 ### 3. Re-init SDL + session_reset on rematch
 

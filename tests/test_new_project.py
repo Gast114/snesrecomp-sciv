@@ -13,9 +13,11 @@ are exercised by hand against a real framework checkout.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -23,6 +25,13 @@ import pytest
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SETUP = REPO_ROOT / "tools" / "new_project" / "setup_project.sh"
 PROBE = REPO_ROOT / "tools" / "new_project" / "probe_rom.py"
+
+
+@pytest.fixture(autouse=True)
+def _use_test_interpreter(monkeypatch):
+    # Shell subprocesses must use the same installed Python as pytest, not
+    # Windows' python3 Store alias or an unrelated MSYS installation.
+    monkeypatch.setenv("PYTHON", pathlib.Path(sys.executable).as_posix())
 
 
 def _fixture_rom(path: pathlib.Path) -> None:
@@ -70,7 +79,7 @@ def test_probe_reads_the_cartridge_header():
         _fixture_rom(rom)
         out = tmp / "probe.json"
         subprocess.run(
-            ["python3", str(PROBE), str(rom), "--json-out", str(out), "--quiet"],
+            [sys.executable, str(PROBE), str(rom), "--json-out", str(out), "--quiet"],
             check=True, cwd=REPO_ROOT)
         info = json.loads(out.read_text())
 
@@ -97,7 +106,7 @@ def test_probe_flags_an_unverifiable_header():
         rom.write_bytes(bytes(raw))
         out = tmp / "probe.json"
         subprocess.run(
-            ["python3", str(PROBE), str(rom), "--json-out", str(out), "--quiet"],
+            [sys.executable, str(PROBE), str(rom), "--json-out", str(out), "--quiet"],
             check=True, cwd=REPO_ROOT)
         assert json.loads(out.read_text())["checksum_valid"] is False
 
@@ -117,7 +126,8 @@ def test_scaffold_writes_the_expected_layout():
         assert not missing, f"scaffold omitted: {missing}"
         for script in ("tools/regen.sh", "scripts/package_release.sh"):
             mode = (project / script).stat().st_mode
-            assert mode & 0o111, f"{script} is not executable"
+            if os.name != "nt":  # Windows stat does not expose POSIX chmod bits.
+                assert mode & 0o111, f"{script} is not executable"
 
 
 def test_scaffold_leaves_no_unfilled_tokens():
@@ -158,7 +168,7 @@ def test_scaffold_carries_rom_identity_into_the_pipeline():
         # The launcher's path cache is seeded with the dump the project was
         # set up from, so the first launch does not ask for a ROM.
         cache = (project / "rom.cfg").read_text(encoding="utf-8").strip()
-        assert cache == str((tmp / "fixture.sfc").resolve()), cache
+        assert pathlib.Path(cache).resolve() == (tmp / "fixture.sfc").resolve(), cache
         assert sha in identity, "rom_identity.txt is missing the ROM SHA-256"
         # The catalog matches on every digest; a submission takes them from
         # here instead of hashing the ROM again, so all of them are recorded.
@@ -644,3 +654,80 @@ def test_the_desktop_host_arms_the_header_shadowing_guard():
     assert "version" in runner[runner.index(
         "set(SNESRECOMP_STDLIB_EXTENSIONLESS_HEADERS"):], \
         "<version> dropped from the shadowing list -- it is the one that bit"
+
+
+# Through the same `sh` the scaffold runs under: on Windows a bare `bash`
+# can resolve to WSL, which does not see this environment.
+_REGEN = ["sh", "-c", "exec bash tools/regen.sh"]
+
+
+def test_regen_finds_the_rom_the_wizard_recorded():
+    """#130: the wizard records the ROM in rom.cfg and the launcher uses it,
+    so regen.sh must too -- the ROM is not at the repo root, and nobody has
+    passed --rom or set SNESRECOMP_ROM."""
+    with tempfile.TemporaryDirectory() as directory:
+        project = _scaffold(pathlib.Path(directory))
+        assert (project / "rom.cfg").is_file()
+        env = dict(os.environ, SNESRECOMP_ROOT=REPO_ROOT.as_posix(),
+                   PYTHON=pathlib.Path(sys.executable).as_posix())
+        env.pop("SNESRECOMP_ROM", None)
+        result = subprocess.run(
+            _REGEN, cwd=project, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert result.returncode == 0, result.stdout
+        assert "fixture.sfc" in result.stdout, result.stdout
+        assert any((project / "src" / "gen").glob("*.c")), result.stdout
+
+        (project / "rom.cfg").unlink()
+        result = subprocess.run(
+            _REGEN, cwd=project, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert result.returncode != 0
+        assert "rom.cfg" in result.stdout, result.stdout
+
+
+def _resolve(root, *names, explicit=None):
+    sys.path.insert(0, str(REPO_ROOT))
+    import snesrecomp_cli
+    return snesrecomp_cli.resolve_project_rom(root, list(names), explicit)
+
+
+def test_project_rom_search_order(tmp_path, monkeypatch):
+    monkeypatch.delenv("SNESRECOMP_ROM", raising=False)
+    for name in ("explicit.sfc", "env.sfc", "game.sfc", "cached.sfc"):
+        (tmp_path / name).write_bytes(b"\0")
+    (tmp_path / "rom.cfg").write_text("cached.sfc\n")      # relative to root
+    assert _resolve(tmp_path, "game.sfc") == tmp_path / "game.sfc"
+    assert _resolve(tmp_path, "absent.sfc") == tmp_path / "cached.sfc"
+    monkeypatch.setenv("SNESRECOMP_ROM", str(tmp_path / "env.sfc"))
+    assert _resolve(tmp_path, "game.sfc") == tmp_path / "env.sfc"
+    assert _resolve(tmp_path, "game.sfc", explicit=str(tmp_path / "explicit.sfc")) \
+        == tmp_path / "explicit.sfc"
+
+
+def test_project_rom_errors_name_their_source(tmp_path, monkeypatch):
+    monkeypatch.delenv("SNESRECOMP_ROM", raising=False)
+    with pytest.raises(ValueError, match="no ROM found"):
+        _resolve(tmp_path, "game.sfc")
+    (tmp_path / "rom.cfg").write_text(str(tmp_path / "moved.sfc") + "\n")
+    with pytest.raises(ValueError, match="rom.cfg"):
+        _resolve(tmp_path, "game.sfc")
+    monkeypatch.setenv("SNESRECOMP_ROM", str(tmp_path / "gone.sfc"))
+    with pytest.raises(ValueError, match="SNESRECOMP_ROM"):
+        _resolve(tmp_path, "game.sfc")
+
+
+def test_project_rom_never_joins_a_windows_path(tmp_path, monkeypatch):
+    """The wizard writes rom.cfg as C:/...; MSYS/Cygwin Python can open that
+    but does not call it absolute, and joining it onto the project root
+    produced a path that never exists."""
+    monkeypatch.delenv("SNESRECOMP_ROM", raising=False)
+    (tmp_path / "rom.cfg").write_text("C:/dumps/game.sfc\n")
+    checked = []
+    real = pathlib.Path.is_file
+    def is_file(self):
+        checked.append(str(self).replace("\\", "/"))
+        return str(self).replace("\\", "/") == "C:/dumps/game.sfc" or real(self)
+    monkeypatch.setattr(pathlib.Path, "is_file", is_file)
+    assert str(_resolve(tmp_path, "absent.sfc")).replace("\\", "/") == "C:/dumps/game.sfc"
+    assert not any(c.endswith("/C:/dumps/game.sfc") for c in checked), checked

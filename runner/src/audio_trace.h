@@ -160,7 +160,8 @@ typedef struct AudioTraceStats {
   uint64_t consumed;          /* total native samples read for output   */
   uint64_t fast_forward_discarded; /* stale queued samples removed only
                                     * on the fast-forward -> normal edge */
-  uint64_t output_underflows; /* callbacks with <1 guest-produced block */
+  uint64_t output_underflows; /* callbacks that enter a starvation episode */
+  uint64_t output_priming;    /* callbacks intentionally rebuilding cushion */
   uint64_t output_missing_frames; /* device-rate stereo frames without PCM */
   uint64_t consume_calls;     /* dsp_getSamples calls (audio callbacks) */
   uint64_t reg_writes;        /* DSP register writes                    */
@@ -264,6 +265,7 @@ void audio_trace_on_guest_sync(int frame_boundary, uint64_t cycles);
 void audio_trace_on_fast_forward_discard(uint32_t samples,
                                          uint32_t occupancy_after);
 void audio_trace_on_output_underflow(uint32_t occupancy, uint32_t missing_frames);
+void audio_trace_on_output_priming(uint32_t occupancy);
 /* CPU<->SPC port traffic. port = 0-3. All call sites hold RtlApuLock.
  * The SPC-read / CPU-read hooks gate internally (value change or fresh
  * counterpart write); callers pass every access unconditionally. */
@@ -300,6 +302,31 @@ uint32_t audio_trace_copy_events(uint64_t first_idx, uint32_t max,
                                  AudioTraceEvent *out, uint64_t *oldest);
 uint32_t audio_trace_copy_snaps(uint64_t first_idx, uint32_t max,
                                 AudioTraceSnap *out, uint64_t *oldest);
+/* Always-on CPU<->SPC port ring, every build and every history level: the
+ * port events above, and nothing else, so DSP register traffic cannot evict
+ * the handshake that matters. A sound command's fate (written, applied, seen
+ * by the engine, echoed, read back by the CPU) can be read for thousands of
+ * frames after the fact. The beam position lets it be lined up against an
+ * oracle's port log (tools/mesen_scene apu_log=1). */
+#define AUDIO_TRACE_PORT_RING (1u << 16)
+typedef struct AudioTracePortEvent {
+  uint64_t sample_idx;   /* native-sample clock */
+  uint32_t frame;        /* snes_frame_counter */
+  uint16_t vpos, hpos;   /* beam position when it happened */
+  uint8_t  type;         /* AUDIO_TRACE_EV_CPU_PORT_WRITE .. _APPLY */
+  uint8_t  port;         /* 0-3: $2140+n / $F4+n */
+  uint8_t  val;
+  uint8_t  pad;
+} AudioTracePortEvent;
+/* Where the beam is, for the port ring. The machine registers it (SnesInit);
+ * the trace has no other link to the PPU. */
+typedef void AudioTraceBeamProbe(uint16_t *vpos, uint16_t *hpos);
+void audio_trace_set_beam_probe(AudioTraceBeamProbe *probe);
+/* Copy port events [first_idx, first_idx+max); returns count copied and the
+ * oldest index still held through *oldest. *total gets the count ever seen. */
+uint32_t audio_trace_copy_port_events(uint64_t first_idx, uint32_t max,
+                                      AudioTracePortEvent *out,
+                                      uint64_t *oldest, uint64_t *total);
 /* Write a 32 kHz stereo 16-bit WAV of PCM-ring samples
  * [start_idx, start_idx+count). start_idx<0 / count==0 mean "everything
  * still in the ring". Returns 0 on success, writes the actually-dumped

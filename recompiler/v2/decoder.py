@@ -41,7 +41,7 @@ if str(_RECOMPILER_DIR) not in sys.path:
     sys.path.insert(0, str(_RECOMPILER_DIR))
 
 from snes65816 import (  # noqa: E402
-    decode_insn, lorom_offset, Insn,
+    decode_insn, lorom_offset, rom_bank_mirror, is_materialized_rom_address, Insn,
     ABS, INDIR, INDIR_X, LONG, IMM,
 )
 
@@ -103,230 +103,16 @@ def _dispatch_kind(insn, table_bases=()) -> str:
             else 'short')
 
 
-def _autorecover_indirect_dp(rom: bytes, bank: int, func_start: int,
-                             site_pc: int, dp_addr: int,
-                             insn_length: int,
-                             data_regions=None,
-                             max_scan_insns: int = 256
-                             ) -> Optional[Tuple[Tuple[int, ...], str]]:
-    """For a `JMP ($<dp>)` (length 3, 16-bit indirect) or `JML [<dp>]`
-    (length 3, opcode DC, 24-bit indirect at abs <dp>) at `site_pc`:
-    walk the function from `func_start` to `site_pc-1`, accumulating
-    `LDA <ABS_X table>,X / STA $<dp>`-style pair sequences that write
-    the DP pointer immediately before the dispatch. Returns
-    `(table_bases, idx_reg)` if a pattern matched, else None.
-
-    Pattern shapes recognised:
-      A. JMP indirect, M=1 split-byte form:
-           LDA <tbl_lo>,X ; STA $<dp>
-           LDA <tbl_hi>,X ; STA $<dp+1>
-         → return ((tbl_lo, tbl_hi), 'X')
-      B. JML indirect, M=1 split-byte form:
-           LDA <tbl_lo>,X ; STA $<dp>
-           LDA <tbl_hi>,X ; STA $<dp+1>
-           LDA <tbl_bk>,X ; STA $<dp+2>
-         → return ((tbl_lo, tbl_hi, tbl_bk), 'X')
-      C. M=0 single-word form:
-           LDA <tbl>,X ; STA $<dp>   (16-bit LDA/STA covers both bytes)
-         → return ((tbl,), 'X')
-
-    Index register: derived from the LDA's addressing mode (`,X` or `,Y`).
-    Both must use the same index. Mixed forms are rejected.
-
-    The walk is linear from func_start. Branches and intervening writes
-    to the DP slots are tolerated as long as the LDA/STA pair that
-    "wins" is the most recent one before the dispatch. SEP/REP state is
-    tracked so M is known when the JMP fires.
-    """
-    from snes65816 import (decode_insn, lorom_offset, ABS_X, LONG_X,
-                            ABS_Y, DP)
-    # Most-recent winners per DP slot (offset 0, 1, 2 from dp_addr base).
-    # Each is (table_base, table_mode, idx_reg).
-    winners: dict = {}
-    pc = func_start & 0xFFFF
-    m_state = 1
-    x_state = 1
-    last_lda_table: Optional[Tuple[int, int, str]] = None
-    scanned = 0
-    while pc < site_pc and scanned < max_scan_insns:
-        try:
-            off = lorom_offset(bank, pc)
-        except AssertionError:
-            return None
-        if off >= len(rom):
-            return None
-        try:
-            insn = decode_insn(rom, off, pc=pc, bank=bank,
-                               m=m_state, x=x_state)
-        except Exception:
-            return None
-        if insn is None:
-            return None
-        mnem = insn.mnem
-        # Track M/X state across REP/SEP — table-base recovery is the
-        # same regardless of M, but instruction LENGTHS depend on it.
-        if mnem == 'REP':
-            if insn.operand & 0x20:
-                m_state = 0
-            if insn.operand & 0x10:
-                x_state = 0
-        elif mnem == 'SEP':
-            if insn.operand & 0x20:
-                m_state = 1
-            if insn.operand & 0x10:
-                x_state = 1
-        # Capture the most-recent LDA <ABS/LONG, X/Y> — these are the
-        # candidate sources for the next STA to a DP slot.
-        if mnem == 'LDA' and insn.mode in (ABS_X, LONG_X):
-            last_lda_table = (insn.operand & 0xFFFF, insn.mode, 'X')
-        elif mnem == 'LDA' and insn.mode == ABS_Y:
-            last_lda_table = (insn.operand & 0xFFFF, insn.mode, 'Y')
-        elif mnem == 'STA' and insn.mode == DP:
-            slot = (insn.operand & 0xFFFF) - (dp_addr & 0xFFFF)
-            if 0 <= slot <= 2 and last_lda_table is not None:
-                # Pair the LDA we just saw with this STA — it
-                # writes one byte of the dispatch pointer.
-                winners[slot] = last_lda_table
-                # Don't reuse the same LDA for another slot.
-                last_lda_table = None
-        # Any other write to one of the DP slots WITHOUT a preceding
-        # paired LDA invalidates the pattern (someone else clobbers it).
-        elif mnem == 'STA' or mnem == 'STZ':
-            slot = (insn.operand & 0xFFFF) - (dp_addr & 0xFFFF)
-            if 0 <= slot <= 2:
-                # Allow STZ + STA without LDA pairing only if it's
-                # writing zero (defensive). Drop the slot.
-                winners.pop(slot, None)
-        # Any LDA to a non-table mode — clear the candidate.
-        elif mnem == 'LDA':
-            last_lda_table = None
-        scanned += 1
-        pc = (pc + insn.length) & 0xFFFF
-
-    if not winners:
-        return None
-
-    # Validate winners: same idx_reg across all collected slots.
-    idx_regs = set(w[2] for w in winners.values())
-    if len(idx_regs) != 1:
-        return None
-    idx_reg = next(iter(idx_regs))
-
-    # Resolve to ordered tuple of table bases. Need consecutive slots
-    # starting at slot 0. For JML (insn_length == 3, opcode DC → 24-bit
-    # indirect) expect 3 slots; for JMP (16-bit indirect) expect 1 or 2.
-    needed_slots = 3 if (insn_length == 3 and m_state == 1
-                          # Heuristic: JML form needs 3 (opcode DC).
-                          # Caller will sanity-check via opcode anyway.
-                          and 2 in winners) else (2 if 1 in winners else 1)
-    table_bases: List[int] = []
-    for s in range(needed_slots):
-        if s not in winners:
-            return None
-        table_bases.append(winners[s][0])
-    return (tuple(table_bases), idx_reg)
-
-
-def _autorecover_dp_table_count(rom: bytes, bank: int,
-                                table_bases: Tuple[int, ...],
-                                data_regions=None,
-                                max_entries: int = 256) -> Optional[int]:
-    """Walk the parallel byte-tables for a DP-pointer dispatch and
-    return the count of valid entries before the first invalid one.
-
-    table_bases: 1, 2 or 3 16-bit table bases in the dispatching insn's
-    bank. Each table holds one byte per dispatch index. The composed
-    target is:
-        len==1: pointer = (bank << 16) | (rom[base[0]+i] but how is
-                  this a 16-bit ptr from 1 byte? Skipped — len==1 is
-                  not a valid composition; returns 0 in that case.)
-        len==2: pointer = (bank << 16) | (hi << 8) | lo
-        len==3: pointer = (bank << 16) | (hi << 8) | lo  — wait, with
-                  bank table: pointer = (bk << 16) | (hi << 8) | lo
-
-    For each i in 0..max-1, check the composed pointer is valid:
-      - target's bank in [00..FF] (always true, defensive)
-      - target's 16-bit pc in [$8000..$FFFF]
-      - target bytes don't look like padding
-      - target not in any data_region
-    Stop at first invalid; return how many were valid.
-    """
-    if not table_bases:
-        return None
-    if len(table_bases) == 1:
-        # M=0 single-word form: each table entry is a 2-byte ptr at
-        # `base + 2*i` in the dispatcher's bank. Treat the table as
-        # a contiguous 16-bit-entry array; walk until invalid.
-        base = table_bases[0] & 0xFFFF
-        count = 0
-        for i in range(max_entries):
-            tbl_pc = (base + 2 * i) & 0xFFFF
-            if tbl_pc + 1 > 0xFFFF:
-                break
-            try:
-                off = lorom_offset(bank, tbl_pc)
-            except AssertionError:
-                break
-            if off + 1 >= len(rom):
-                break
-            addr16 = rom[off] | (rom[off + 1] << 8)
-            if addr16 == 0:
-                break
-            if addr16 < 0x8000:
-                break
-            if _addr_in_data_regions(data_regions, bank, addr16):
-                break
-            if _dispatch_target_is_padding(rom, bank, addr16):
-                break
-            count += 1
-        return count if count > 0 else None
-    lo_base = table_bases[0] & 0xFFFF
-    hi_base = table_bases[1] & 0xFFFF
-    bk_base = table_bases[2] & 0xFFFF if len(table_bases) >= 3 else None
-    count = 0
-    for i in range(max_entries):
-        try:
-            lo_off = lorom_offset(bank, (lo_base + i) & 0xFFFF)
-            hi_off = lorom_offset(bank, (hi_base + i) & 0xFFFF)
-        except AssertionError:
-            break
-        if max(lo_off, hi_off) >= len(rom):
-            break
-        lo = rom[lo_off]
-        hi = rom[hi_off]
-        if bk_base is not None:
-            try:
-                bk_off = lorom_offset(bank, (bk_base + i) & 0xFFFF)
-            except AssertionError:
-                break
-            if bk_off >= len(rom):
-                break
-            eb = rom[bk_off]
-        else:
-            eb = bank
-        addr16 = (hi << 8) | lo
-        if addr16 == 0:
-            # Single null tolerated; two consecutive = stop.
-            # Simpler: stop on first null. Real handlers don't sit at $0000.
-            break
-        if addr16 < 0x8000:
-            break
-        if _addr_in_data_regions(data_regions, eb, addr16):
-            break
-        if _dispatch_target_is_padding(rom, eb, addr16):
-            break
-        count += 1
-    return count if count > 0 else None
-
-
 def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
                                  data_regions=None,
                                  max_entries: int = 256,
-                                 func_start: Optional[int] = None) -> Optional[List[int]]:
+                                 func_start: Optional[int] = None
+                                 ) -> Optional[Tuple[List[int], int]]:
     """Walk the dispatch table for a `JMP (abs,X)` / `JML (abs,X)` /
-    `JSR (abs,X)` at `insn`. Returns a list of 24-bit target PCs, or
-    None if the very first entry already looks invalid (no table at
-    this site).
+    `JSR (abs,X)` at `insn`. Returns `(targets, index_bias)` — a list of
+    24-bit target PCs plus the byte distance from the instruction's
+    operand to entry 0 (0 for the ordinary layout) — or None if the very
+    first entry already looks invalid (no table at this site).
 
     Termination rules (in order):
       1. table address would cross the bank boundary ($FFFF)
@@ -356,8 +142,53 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
     """
     base = insn.operand & 0xFFFF
     entry_size = 3 if _dispatch_kind(insn) == 'long' else 2
+    # --- Where does the table actually START? ---------------------------
+    # The operand of `JSR/JMP ($base,X)` is the address the index is added
+    # to, NOT necessarily the address of entry 0. The walk below has always
+    # assumed the two coincide and that X is a multiple of entry_size; that
+    # assumption is a real ROM fact for most tables and a silent wrong
+    # answer for the rest.
+    #
+    # Yoshi's Island proves the difference. Two of its dispatchers name
+    # their own `RTL` opcode as the operand so the table begins one byte
+    # later, and index with a state variable that steps 1, 3, 5, ... :
+    #
+    #     CODE_01DE80: JSR ($DE84,x)   ; X = r_msg_box_state (1,3,5,...)
+    #                  PLB
+    #                  RTL             ; $01DE84 -- the operand byte
+    #     message_box_state_ptr:       ; $01DE85 -- entry 0 lives HERE
+    #                  dw $DE93 ...
+    #
+    # Walking from $DE84 at stride 2 reads every pointer one byte low
+    # ($6B93 -> $01936B, $DEA9 -> $01A9DE, ...). Those are addresses in the
+    # middle of unrelated routines; they compile, link and run, and the
+    # guest disappears into them. Nothing downstream can tell such a list
+    # from a real one -- the only authority that can is the cfg
+    # `data_region` overlay, which states outright which bytes are the
+    # table. Use it: align the walk to the region and bound it by the
+    # region's end (a table that runs past the end of a declared data span
+    # is reading code bytes as pointers, which is provably wrong).
+    #
+    # `index_bias` is the byte distance from the operand to entry 0; it is
+    # handed to codegen, which recovers the logical index as
+    # `(idx_reg - index_bias) / entry_size`. A selector that lands outside
+    # the table (e.g. an even X here) wraps out of range and takes the
+    # live-pointer interpreter path, which is faithful by construction.
+    index_bias = 0
+    region_end: Optional[int] = None
+    _region = _data_region_containing(data_regions, bank, base)
+    if _region is not None:
+        region_end = _region[2]
+    else:
+        for _delta in range(1, entry_size):
+            _region = _data_region_starting_at(data_regions, bank,
+                                               (base + _delta) & 0xFFFF)
+            if _region is not None:
+                index_bias = _delta
+                region_end = _region[2]
+                break
     entries: List[int] = []
-    tbl_pc = base
+    tbl_pc = (base + index_bias) & 0xFFFF
     nulls_in_a_row = 0
     # Hard code boundary for the table-precedes-dispatcher layout: the
     # table ends where the dispatcher's own function begins.
@@ -391,6 +222,12 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
         # Stop at the dispatcher's own function start (table-precedes-
         # dispatcher layout): no entry can begin at/after it.
         if code_boundary is not None and tbl_pc >= code_boundary:
+            break
+        # Stop at the end of the declared data span holding the table. An
+        # entry that reaches past it is composed of code bytes, which is a
+        # mis-decode however plausible the resulting address looks. This is
+        # the same authority that fixed the start, applied to the end.
+        if region_end is not None and tbl_pc + entry_size > region_end:
             break
         # Stop if the next entry's read range would overlap any already-
         # accepted in-bank handler at/above the table base. Equivalent
@@ -443,7 +280,9 @@ def _autorecover_indirect_xtable(rom: bytes, bank: int, insn,
         if eb == bank and base <= addr16 <= 0xFFFF:
             inbank_handler_pcs.append(addr16)
         tbl_pc += entry_size
-    return entries if entries else None
+    if not entries:
+        return None
+    return entries, index_bias
 
 
 def _autorecover_local_stride_runway(rom: bytes, bank: int, func_start: int,
@@ -564,6 +403,34 @@ def _autorecover_local_stride_runway(rom: bytes, bank: int, func_start: int,
     if len(entries) < 4:
         return None
     return entries
+
+
+def _data_region_containing(data_regions, bank: int, pc16: int
+                            ) -> Optional[Tuple[int, int, int]]:
+    """The cfg `data_region` tuple (bank, start, end_exclusive) covering
+    (bank, pc16), or None. Lets a caller use the region's own bounds, not
+    just the yes/no answer `_addr_in_data_regions` gives."""
+    if not data_regions:
+        return None
+    for region in data_regions:
+        b, start, end = region
+        if b == bank and start <= (pc16 & 0xFFFF) < end:
+            return region
+    return None
+
+
+def _data_region_starting_at(data_regions, bank: int, pc16: int
+                             ) -> Optional[Tuple[int, int, int]]:
+    """The cfg `data_region` tuple that STARTS exactly at (bank, pc16), or
+    None. Used to recognise a dispatch table whose first entry sits just
+    after the operand byte (see `_autorecover_indirect_xtable`)."""
+    if not data_regions:
+        return None
+    for region in data_regions:
+        b, start, _end = region
+        if b == bank and start == (pc16 & 0xFFFF):
+            return region
+    return None
 
 
 def _addr_in_data_regions(data_regions, bank: int, pc16: int) -> bool:
@@ -734,6 +601,7 @@ class FunctionDecodeGraph:
             statically-proven Z + the surviving and pruned edges.
     """
     entry: DecodeKey
+    authority_conflict: bool = False
     insns: Dict[DecodeKey, DecodedInsn] = field(default_factory=dict)
     suppressed_indirect_calls: List[SuppressedIndirectCall] = field(default_factory=list)
     const_z_folds: List[ConstZFold] = field(default_factory=list)
@@ -1105,7 +973,7 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
             nskip = inline_arg_map.get(target_pc24)
             if nskip is None:
                 tbank = (target_pc24 >> 16) & 0xFF
-                if tbank < 0x40 or 0x80 <= tbank < 0xC0:
+                if rom_bank_mirror(tbank) is not None:
                     nskip = inline_arg_map.get(target_pc24 ^ 0x800000)
             if nskip:
                 next_pc = (next_pc + nskip) & 0xFFFF
@@ -1119,7 +987,7 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
                 hit = callee_exit_mx.get(key_lookup)
                 if hit is None:
                     tbank = (target_pc24 >> 16) & 0xFF
-                    if tbank < 0x40 or 0x80 <= tbank < 0xC0:
+                    if rom_bank_mirror(tbank) is not None:
                         mirror_pc24 = target_pc24 ^ 0x800000
                         hit = callee_exit_mx.get(
                             (mirror_pc24, post_m, post_x))
@@ -1145,7 +1013,7 @@ def _labeled_successors(insn: Insn, key: DecodeKey, bank: int,
             mode_set = callee_exit_mx_modes.get((target_pc24, post_m, post_x))
             if mode_set is None:
                 tbank = (target_pc24 >> 16) & 0xFF
-                if tbank < 0x40 or 0x80 <= tbank < 0xC0:
+                if rom_bank_mirror(tbank) is not None:
                     mode_set = callee_exit_mx_modes.get(
                         (target_pc24 ^ 0x800000, post_m, post_x))
             if mode_set is not None:
@@ -1316,7 +1184,8 @@ def _detect_inline_arg_bytes_stack_slot(rom: bytes, bank: int, addr: int,
     budget = 0
     while budget < 96:
         budget += 1
-        if not (0x8000 <= pc <= 0xFFFF):
+        from snes65816 import is_rom_address
+        if not is_rom_address(bank, pc):
             return None
         try:
             off = lorom_offset(bank, pc)
@@ -1683,7 +1552,8 @@ def detect_dp_return_inline_arg_bytes(rom: bytes, bank: int, addr: int):
     budget = 0
     while budget < 160:
         budget += 1
-        if not (0x8000 <= pc <= 0xFFFF):
+        from snes65816 import is_rom_address
+        if not is_rom_address(bank, pc):
             return None
         try:
             off = lorom_offset(bank, pc)
@@ -1778,7 +1648,8 @@ def classify_dispatch_helper(rom: bytes, bank: int, addr: int):
     safety = 0
     while safety < 256:
         safety += 1
-        if not (0x8000 <= pc <= 0xFFFF):
+        from snes65816 import is_rom_address
+        if not is_rom_address(bank, pc):
             return None
         try:
             offset = lorom_offset(bank, pc)
@@ -1904,6 +1775,44 @@ def set_decode_cache_enabled(enabled: bool) -> None:
         clear_decode_cache()
 
 
+_INSTRUCTION_AUTHORITY = {}
+_AUTHORITY_DATA = {}
+
+
+def set_instruction_authority(parsed):
+    """Install byte/boundary constraints for one analysis and emission run."""
+    global _INSTRUCTION_AUTHORITY, _AUTHORITY_DATA
+    authority = {}
+    data = {}
+    for bank, _path, cfg in parsed:
+        for start, end in cfg.authority_data:
+            banks = [bank]
+            mirror = rom_bank_mirror(bank)
+            if mirror is not None and start >= 0x8000:
+                banks.append(mirror)
+            for mapped_bank in banks:
+                mask = data.setdefault(mapped_bank, bytearray(0x10000))
+                mask[start:end] = b'\x01' * (end-start)
+        for start, raw in cfg.authority_insns.items():
+            banks = [bank]
+            mirror = rom_bank_mirror(bank)
+            if mirror is not None and start >= 0x8000:
+                banks.append(mirror)
+            for mapped_bank in banks:
+                for n in range(len(raw)):
+                    pc = (mapped_bank << 16) | (start + n)
+                    value = raw if n == 0 else b""
+                    if pc in authority and authority[pc] != value:
+                        raise ValueError(f"overlapping instruction authority at {pc:06X}")
+                    authority[pc] = value
+    if any(data.get(pc >> 16, b'')[pc & 0xFFFF: (pc & 0xFFFF)+1] == b'\x01'
+           for pc in authority):
+        raise ValueError("instruction authority overlaps authoritative data")
+    _INSTRUCTION_AUTHORITY = authority
+    _AUTHORITY_DATA = data
+    clear_decode_cache()
+
+
 def clear_decode_cache() -> None:
     """Drop every cached decode result and reset counters."""
     global _DECODE_CACHE_HITS, _DECODE_CACHE_MISSES
@@ -1991,6 +1900,7 @@ def decode_function(rom: bytes, bank: int, start: int,
                      terminal_jsr_sites: Optional[set] = None,
                      noreturn_jsr_sites: Optional[set] = None,
                      stop_on_unknown_callee_exit: bool = False,
+                     hle_entry_pcs: Optional[set] = None,
                     ) -> "FunctionDecodeGraph":
     """Public cached wrapper around `_decode_function_uncached`.
 
@@ -2016,6 +1926,7 @@ def decode_function(rom: bytes, bank: int, start: int,
             terminal_jsr_sites=terminal_jsr_sites,
             noreturn_jsr_sites=noreturn_jsr_sites,
             stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
+            hle_entry_pcs=hle_entry_pcs,
         )
 
     cache_key = (
@@ -2032,6 +1943,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         _identity(terminal_jsr_sites),
         _identity(noreturn_jsr_sites),
         bool(stop_on_unknown_callee_exit),
+        frozenset(pc & 0xFFFF for pc in (hle_entry_pcs or ())),
     )
     cached = _DECODE_CACHE.get(cache_key)
     if cached is not None:
@@ -2056,6 +1968,7 @@ def decode_function(rom: bytes, bank: int, start: int,
         terminal_jsr_sites=terminal_jsr_sites,
         noreturn_jsr_sites=noreturn_jsr_sites,
         stop_on_unknown_callee_exit=stop_on_unknown_callee_exit,
+        hle_entry_pcs=hle_entry_pcs,
     )
     _DECODE_CACHE[cache_key] = graph
     return graph
@@ -2077,6 +1990,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                      terminal_jsr_sites: Optional[set] = None,
                      noreturn_jsr_sites: Optional[set] = None,
                      stop_on_unknown_callee_exit: bool = False,
+                     hle_entry_pcs: Optional[set] = None,
                     ) -> FunctionDecodeGraph:
     """Decode a function starting at (bank, start) with entry (m, x) state.
 
@@ -2121,11 +2035,24 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
     The PHB/PLB-balanced cross-fn-jump case is preserved because those
     targets are NOT named function entries — the inline-import path
     still applies. Only cfg-named entries get the tail-call routing.
+    The same set also ends a JSL/JML dispatch-helper inline table: a
+    sibling entry cannot also be table bytes.
     """
     entry_m &= 1
     entry_x &= 1
     entry_key = DecodeKey(addr24(bank, start), entry_m, entry_x)
     graph = FunctionDecodeGraph(entry=entry_key)
+    hle_entry_pcs = frozenset(
+        pc & 0xFFFF for pc in (hle_entry_pcs or ())) - {start & 0xFFFF}
+
+    def _hle_local_goto_entries(entries) -> frozenset:
+        # Local computed-goto dispatch targets that name an HLE boundary.
+        # The worklist turns those edges into boundary exits, so codegen
+        # must emit tail transfers to the stub instead of local gotos.
+        return frozenset(
+            addr24(bank, e & 0xFFFF) for e in entries
+            if e and ((e >> 16) & 0xFF) in (0, bank)
+            and (e & 0xFFFF) in hle_entry_pcs)
 
     # Worklist holds (key, edge_kind, pred_pc). edge_kind is
     # 'entry' for the initial seed, 'jump' for BRA/BRL/JMP-ABS/cond-
@@ -2167,6 +2094,20 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             if boundary not in graph.boundary_exits:
                 graph.boundary_exits.append(boundary)
             continue
+        # A cfg `hle_func` / `hle_spc_upload` PC is replaced by a host
+        # implementation: its ROM bytes must never be compiled into another
+        # function's body. Every edge into it -- jump, fall-through, local
+        # computed goto, from imported territory, inside a caller's explicit
+        # end: range, or in a function with an internal stack dispatch -- is
+        # a tail transfer to the HLE stub. The sibling gate below is not
+        # enough: it covers only jump edges and has range/stack exemptions.
+        if (hle_entry_pcs
+                and edge_kind != 'entry'
+                and pc in hle_entry_pcs):
+            boundary = ((bank << 16) | (pred_pc & 0xFFFF), key)
+            if boundary not in graph.boundary_exits:
+                graph.boundary_exits.append(boundary)
+            continue
         # JUMP edge that lands on a named sibling function entry:
         # refuse the inline-import. emit_function's `_goto_or_return`
         # then emits a tail-call to the sibling (recompiler-level fix
@@ -2197,7 +2138,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             if boundary not in graph.boundary_exits:
                 graph.boundary_exits.append(boundary)
             continue
-        if not (0x8000 <= pc <= 0xFFFF):
+        from snes65816 import is_rom_address
+        if not is_rom_address(bank, pc):
             # Out-of-bank reference; surface upstream by skipping here.
             continue
         if _addr_in_data_regions(data_regions, bank, pc):
@@ -2207,7 +2149,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             offset = lorom_offset(bank, pc)
         except AssertionError:
             continue
-        if offset >= len(rom):
+        if offset >= len(rom) or not is_materialized_rom_address(bank, pc, offset):
             continue
 
         insn = decode_insn(rom, offset, pc, bank, m=key.m, x=key.x)
@@ -2216,6 +2158,15 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                 f"v2 decoder: unknown opcode ${rom[offset]:02X} at "
                 f"${bank:02X}:{pc:04X} entry_mx=({key.m},{key.x})"
             )
+
+        expected = _INSTRUCTION_AUTHORITY.get(key.pc)
+        if (any(_AUTHORITY_DATA.get(bank, b'')[pc:pc+insn.length])
+                or (expected is not None and
+             (len(expected) != insn.length or rom[offset:offset + insn.length] != expected))
+                or any(_INSTRUCTION_AUTHORITY.get(key.pc + n)
+                       for n in range(1, insn.length))):
+            graph.authority_conflict = True
+            continue
 
         # Stamp entry mode on the Insn so downstream consumers (cfg, IR,
         # codegen) see the entry state without needing the DecodeKey.
@@ -2256,7 +2207,28 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             entries = []
             entry_size = 3 if helper_kind == 'long' else 2
             tbl_pc = (pc + insn.length) & 0xFFFF
+            # A data region beginning exactly at the inline table supplies
+            # its byte boundary. An unused slot targeting data inside that
+            # boundary is not the end of the table (SMW sprite $36 precedes
+            # valid sprites $37..$C8). Keep its index/target, while the normal
+            # data-region gate still prevents compiling that target as code.
+            table_ends = [e for b, s, e in (data_regions or ())
+                          if b == bank and s == tbl_pc and e > s
+                          and (e-s) % entry_size == 0]
+            table_end = min(table_ends) if table_ends else None
             while len(entries) < 256 and tbl_pc + entry_size - 1 <= 0xFFFF:
+                if table_end is not None and tbl_pc + entry_size > table_end:
+                    break
+                # Bound the table at the next declared function entry: a
+                # sibling entry starts the following routine, so its bytes
+                # cannot also be table data (SMW ProcessPlayerAnimation
+                # `JSL ExecutePtr` at $00C595 has 14 entries; without this
+                # bound two more are read from PlayerState0B_RescuedPeach at
+                # $C5B5). Mirrors the native analyzer, so analysis and
+                # emission agree on the table length.
+                if (entries and sibling_entry_pcs is not None
+                        and (tbl_pc & 0xFFFF) in sibling_entry_pcs):
+                    break
                 try:
                     tbl_off = lorom_offset(bank, tbl_pc)
                 except AssertionError:
@@ -2308,7 +2280,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                                 reason='data_region',
                                 table_index=len(entries),
                             ))
-                        break
+                        if table_end is None:
+                            break
                     full_entry = (eb << 16) | addr16
                 else:
                     if addr16 == 0:
@@ -2327,7 +2300,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                                 reason='data_region',
                                 table_index=len(entries),
                             ))
-                        break
+                        if table_end is None:
+                            break
                     full_entry = (bank << 16) | addr16
                 # NOTE: do NOT bound the entry value by the dispatching
                 # function's [start, end) range. The TABLE bytes live in
@@ -2381,10 +2355,11 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             # the site (cfg overrides — same count, but explicit beats
             # heuristic).
             if auth is None and insn.mode == INDIR_X:
-                entries = _autorecover_indirect_xtable(rom, bank, insn,
-                                                       data_regions,
-                                                       func_start=start)
-                if entries:
+                recovered = _autorecover_indirect_xtable(rom, bank, insn,
+                                                         data_regions,
+                                                         func_start=start)
+                if recovered:
+                    entries, index_bias = recovered
                     auth = {
                         'count': len(entries),
                         'idx_reg': 'X',
@@ -2392,6 +2367,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         # Preserve tolerated null slots. Re-reading only the
                         # count turned a raw $0000 into bank:$0000.
                         'targets': tuple(entries),
+                        'index_bias': index_bias,
                         '_autorecovered': True,
                     }
             # Auto-recovery for (abs) / [abs] DP-built-pointer form:
@@ -2405,22 +2381,19 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                 # is < $0100 and we can walk-back to find tables.
                 dp_op = insn.operand & 0xFFFF
                 if 0x0000 <= dp_op <= 0x00FF:
-                    rec = _autorecover_indirect_dp(
-                        rom, bank, start, pc, dp_op,
-                        insn.length, data_regions=data_regions)
-                    if rec is not None:
-                        table_bases, idx_reg = rec
-                        # Count from walk-until-invalid over the
-                        # recovered tables.
-                        count = _autorecover_dp_table_count(
-                            rom, bank, table_bases, data_regions)
-                        if count:
-                            auth = {
-                                'count': count,
-                                'idx_reg': idx_reg,
-                                'table_bases': table_bases,
-                                '_autorecovered': True,
-                            }
+                    from .pointer_recovery import recover_pointer_targets
+                    entries = recover_pointer_targets(
+                        rom, graph, key, dp_op, insn.opcode == 0xDC,
+                        target_is_code=lambda target: (
+                            (target & 0xFFFF) >= 0x8000
+                            and not _addr_in_data_regions(data_regions, target >> 16, target & 0xFFFF)
+                            and not _dispatch_target_is_padding(rom, target >> 16, target & 0xFFFF)))
+                    if entries:
+                        auth = {
+                            'count': len(entries), 'idx_reg': 'X',
+                            'table_bases': (), 'targets': entries,
+                            'pointer_match': True, '_autorecovered': True,
+                        }
                 if auth is None:
                     entries = _autorecover_local_stride_runway(
                         rom, bank, start, pc, insn,
@@ -2483,7 +2456,14 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     insn.dispatch_kind = _dispatch_kind(
                         insn, auth.get('table_bases', ()))
                     insn.dispatch_idx_reg = auth['idx_reg']
+                    # Byte distance from the operand to entry 0 (see
+                    # `_autorecover_indirect_xtable`). codegen subtracts it
+                    # before dividing by the entry size.
+                    insn.dispatch_index_bias = int(auth.get('index_bias', 0) or 0)
                     insn.dispatch_local_goto = is_local_goto
+                    if is_local_goto:
+                        insn.dispatch_hle_tail_entries = (
+                            _hle_local_goto_entries(entries))
                     insn.dispatch_pointer_match = is_pointer_match
                     insn.dispatch_popped_call_frame = bool(
                         auth.get('popped_call_frame'))
@@ -2550,14 +2530,38 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                                 rom, bank, pc, (pc + insn.length) & 0xFFFF)
                         nxt &= 0xFFFF
                         insn.dispatch_return_pc = nxt
-                        nxt_key = DecodeKey(addr24(bank, nxt), site_m, site_x, ())
-                        succ = [nxt_key]
+                        return_modes = set()
+                        missing_targets = []
+                        for entry in entries:
+                            if not entry:
+                                continue
+                            target = (entry & 0xFFFFFF
+                                      if insn.dispatch_kind == 'long'
+                                      else addr24(bank, entry & 0xFFFF))
+                            modes = _lookup_exit_mx_mode_set(
+                                callee_exit_mx, callee_exit_mx_modes,
+                                target, site_m, site_x)
+                            if modes is None:
+                                missing_targets.append(target)
+                            else:
+                                return_modes.update(modes)
+                        if missing_targets and stop_on_unknown_callee_exit:
+                            for target in missing_targets:
+                                item = (insn.addr & 0xFFFFFF, target, site_m, site_x)
+                                if item not in graph.unknown_callee_exit_sites:
+                                    graph.unknown_callee_exit_sites.append(item)
+                            succ = []
+                        else:
+                            if missing_targets or not return_modes:
+                                return_modes.add((site_m, site_x))
+                            succ = [DecodeKey(addr24(bank, nxt), m, x, key.p_stack)
+                                    for m, x in sorted(return_modes)]
                         # Candidate handlers are cross-function call demands,
                         # not CFG successors of the enclosing caller. Decode
                         # only the PEA-selected continuation here; otherwise
                         # every explicit pointer target is inlined and also
                         # mis-recorded as a boundary tail exit.
-                        decode_succs = [(nxt_key, 'fall')]
+                        decode_succs = [(next_key, 'fall') for next_key in succ]
                     graph.insns[key] = DecodedInsn(key=key, insn=insn,
                                                    successors=succ)
                     for s, sk in decode_succs:
@@ -2604,7 +2608,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     site_x = insn.x_flag & 1
                     nxt = _pea_ptrcall_return_pc(
                         rom, bank, pc, (pc + insn.length) & 0xFFFF)
-                    nxt_key = DecodeKey(addr24(bank, nxt), site_m, site_x, ())
+                    nxt_key = DecodeKey(addr24(bank, nxt), site_m, site_x, key.p_stack)
                     insn.dispatch_pushed_call = True
                     insn.dispatch_pushed_call_frame_size = pushed_call_size
                     insn.dispatch_consumed_stack_bytes = pushed_call_size
@@ -2694,6 +2698,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     insn.dispatch_table_bases = ()
                     insn.dispatch_terminal = True
                     insn.dispatch_local_goto = True
+                    insn.dispatch_hle_tail_entries = (
+                        _hle_local_goto_entries(entries))
                     insn.dispatch_stack_pointer = True
                     insn.dispatch_forced_m = site_m
                     insn.dispatch_forced_x = site_x
@@ -2737,10 +2743,11 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
             # cfg `indirect_dispatch` declarations. cfg still wins when
             # present (explicit beats heuristic).
             if ud_auth is None:
-                entries = _autorecover_indirect_xtable(rom, bank, insn,
-                                                       data_regions,
-                                                       func_start=start)
-                if entries:
+                recovered = _autorecover_indirect_xtable(rom, bank, insn,
+                                                         data_regions,
+                                                         func_start=start)
+                if recovered:
+                    entries, index_bias = recovered
                     ud_auth = {
                         'count': len(entries),
                         'idx_reg': 'X',
@@ -2748,6 +2755,7 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                         # Preserve tolerated null slots. Re-reading only the
                         # count turned a raw $0000 into bank:$0000.
                         'targets': tuple(entries),
+                        'index_bias': index_bias,
                         '_autorecovered': True,
                     }
             if ud_auth is not None:
@@ -2760,6 +2768,8 @@ def _decode_function_uncached(rom: bytes, bank: int, start: int,
                     insn.dispatch_entries = entries
                     insn.dispatch_kind = kind
                     insn.dispatch_idx_reg = ud_auth['idx_reg']
+                    insn.dispatch_index_bias = int(
+                        ud_auth.get('index_bias', 0) or 0)
                     # JSR (abs,X) is always a call dispatch. Candidate
                     # handlers are separate functions/demands; they are not
                     # jump successors inside the caller's CFG.
@@ -3060,7 +3070,7 @@ def _lookup_exit_mx(callee_exit_mx: Optional[Dict],
     hit = callee_exit_mx.get((pc24 & 0xFFFFFF, m & 1, x & 1))
     if hit is None:
         bank = (pc24 >> 16) & 0xFF
-        if bank < 0x40 or 0x80 <= bank < 0xC0:
+        if rom_bank_mirror(bank) is not None:
             hit = callee_exit_mx.get(
                 ((pc24 ^ 0x800000) & 0xFFFFFF, m & 1, x & 1))
     return hit

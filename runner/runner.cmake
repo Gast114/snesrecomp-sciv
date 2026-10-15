@@ -1,3 +1,24 @@
+# Qualified on Windows x64; retain the reference default on other targets.
+# An explicit cache selection always wins, including an existing LLE build.
+set(_SNESRECOMP_FRAME_DEFAULT "LLE")
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _SNESRECOMP_FRAME_PROCESSOR)
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
+   _SNESRECOMP_FRAME_PROCESSOR MATCHES "^(amd64|x86_64|x64)$")
+    set(_SNESRECOMP_FRAME_DEFAULT "HLE")
+endif()
+set(SNESRECOMP_FRAME_IMPL "${_SNESRECOMP_FRAME_DEFAULT}" CACHE STRING
+    "Desktop frame composition (LLE or HLE; Windows x64 defaults to HLE)")
+set_property(CACHE SNESRECOMP_FRAME_IMPL PROPERTY STRINGS LLE HLE)
+if(NOT SNESRECOMP_FRAME_IMPL MATCHES "^(LLE|HLE)$")
+    message(FATAL_ERROR "SNESRECOMP_FRAME_IMPL must be LLE or HLE")
+endif()
+set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/desktop/host_main.c"
+    APPEND PROPERTY COMPILE_DEFINITIONS
+    SNESRECOMP_FRAME_STAGING_HLE=$<STREQUAL:${SNESRECOMP_FRAME_IMPL},HLE>)
+message(STATUS "SNES desktop frame composition: ${SNESRECOMP_FRAME_IMPL}")
+option(SNESRECOMP_EXPOSE_COVERAGE_MOD "Show the default-off Coverage Capture mod" OFF)
+add_compile_definitions(SNESRECOMP_EXPOSE_COVERAGE_MOD=$<BOOL:${SNESRECOMP_EXPOSE_COVERAGE_MOD}>)
+
 # runner.cmake — shared source list for snesrecomp game projects.
 #
 # Usage from a game project's CMakeLists.txt:
@@ -170,20 +191,34 @@ set(SNESRECOMP_RUNNER_SOURCES
     ${SNESRECOMP_RUNNER_ROOT}/src/widescreen.c
     ${SNESRECOMP_RUNNER_ROOT}/src/recomp_hw.c
     ${SNESRECOMP_RUNNER_ROOT}/src/framedump.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/state_dump.c
     ${SNESRECOMP_RUNNER_ROOT}/src/host_paths.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/diagnostics/trace_writer.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/diagnostics/replay_writer.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/host_args.c
     ${SNESRECOMP_RUNNER_ROOT}/src/launcher.c
     ${SNESRECOMP_RUNNER_ROOT}/src/launcher_cache.c
     ${SNESRECOMP_RUNNER_ROOT}/src/launcher_picker.c
     ${SNESRECOMP_RUNNER_ROOT}/src/rom_image_verify.c
     ${SNESRECOMP_RUNNER_ROOT}/src/crc32.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/snapshot_guard.c
     ${SNESRECOMP_RUNNER_ROOT}/src/sha256.c
     ${SNESRECOMP_RUNNER_ROOT}/src/keybinds.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes_overlay_draw.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes_runahead.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes_savestate_menu.c
+    # The facade supplies offline stubs unless this target enables netplay.
+    # Shared menus must link even without snesrecomp_enable_recomp_net().
+    ${SNESRECOMP_RUNNER_ROOT}/src/netplay/snes_netplay.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes_osd.c
     ${SNESRECOMP_RUNNER_ROOT}/src/snes_rewind.c
     ${SNESRECOMP_RUNNER_ROOT}/src/cpu_state.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/program_module.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/rom_patch.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/generic_frame_driver.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/beam_frame_driver.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/content_variant.c
+    ${SNESRECOMP_RUNNER_ROOT}/src/variant_selector.c
     ${SNESRECOMP_RUNNER_ROOT}/src/cpu_trace.c
     ${SNESRECOMP_RUNNER_ROOT}/src/audio_trace.c
     ${SNESRECOMP_RUNNER_ROOT}/src/ppu_dma_trace.c
@@ -336,6 +371,7 @@ endif()
 
 set(SNESRECOMP_RUNNER_LIBRARIES)
 include(${CMAKE_CURRENT_LIST_DIR}/lua.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/data_packs.cmake)
 if(NOT WIN32)
     # cx4.c synthesizes its internal data ROM with libm.
     list(APPEND SNESRECOMP_RUNNER_LIBRARIES m)
@@ -900,6 +936,57 @@ function(snesrecomp_target_generated_code target gen_dir)
         "rebuild wizard is the only path forward in this binary")
 endfunction()
 
+# An ADDITIONAL recompiled program module linked beside the title's own
+# generated code: a content variant's tree (v2_emit --module-prefix <p>),
+# e.g. Super Mario All-Stars inside the SMW executable, or F-Zero's BS Deluxe.
+#
+#     snesrecomp_target_program_module(<target> <gen_dir> [OPTIONAL])
+#
+# The tree must have been generated WITH a prefix (it carries its own
+# module_namespace.h and funcs.h), or its symbols collide with the stock module
+# at link time. Without OPTIONAL an empty directory fails the configure, the
+# same contract as snesrecomp_target_generated_code: a variant the build was
+# asked for and could not include must never ship silently missing. With
+# OPTIONAL the target builds without it and the variant simply is not linked
+# (the runtime then reports "module '<id>' is not part of this build").
+function(snesrecomp_target_program_module target gen_dir)
+    cmake_parse_arguments(_pm "OPTIONAL" "" "" ${ARGN})
+    file(GLOB _pm_sources CONFIGURE_DEPENDS "${gen_dir}/*.c")
+    if(NOT _pm_sources)
+        if(_pm_OPTIONAL)
+            message(STATUS "${target}: program module ${gen_dir} not generated; skipped")
+            return()
+        endif()
+        message(FATAL_ERROR
+            "${gen_dir} is empty -- generate this program module (v2_emit "
+            "--module-prefix) before building, or pass OPTIONAL.")
+    endif()
+    if(NOT EXISTS "${gen_dir}/module_namespace.h")
+        message(FATAL_ERROR
+            "${gen_dir} was generated without --module-prefix: it has no "
+            "module_namespace.h and would collide with the title's own "
+            "generated symbols. Regenerate it with a prefix.")
+    endif()
+    target_sources(${target} PRIVATE ${_pm_sources})
+    if(NOT MSVC)
+        set_source_files_properties(${_pm_sources} PROPERTIES COMPILE_OPTIONS "-w")
+    endif()
+    list(LENGTH _pm_sources _pm_n)
+    message(STATUS "${target}: program module ${_pm_n} translation unit(s) from ${gen_dir}")
+endfunction()
+
+# Opt-in, shared CC0 shader catalog for hosts exposing shader_supported.
+# Keep user-added presets in place; updating built-ins must not delete them.
+function(snesrecomp_target_shader_presets target)
+    set(_presets "${SNESRECOMP_RUNNER_ROOT}/assets/shaders")
+    file(GLOB_RECURSE _preset_files CONFIGURE_DEPENDS "${_presets}/*")
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS ${_preset_files})
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${_presets}" "$<TARGET_FILE_DIR:${target}>/assets/shaders"
+        COMMENT "${target}: staging shared SNES shader presets" VERBATIM)
+endfunction()
+
 # Optional desktop GLSL preset renderer. It deliberately stays out of
 # SNESRECOMP_RUNNER_SOURCES because headless tools and non-OpenGL frontends do
 # not carry the game-owned gl_core/stb/config dependencies it consumes.
@@ -1125,7 +1212,8 @@ function(snesrecomp_target_desktop_host target)
     cmake_parse_arguments(DH "${options}" "" "" ${ARGN})
     target_sources(${target} PRIVATE
         ${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_main.c
-        ${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_clock.c)
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_clock.c
+        ${SNESRECOMP_RUNNER_ROOT}/src/desktop/host_relaunch.c)
     target_include_directories(${target} PRIVATE
         ${SNESRECOMP_RUNNER_ROOT}/src/desktop)
     snesrecomp_target_mmx_config(${target})

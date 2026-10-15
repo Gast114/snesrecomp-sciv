@@ -46,8 +46,9 @@ cmake --build build -j
 
 The ROM does not have to live in the repository — keeping it on your own
 drive is the better habit, and `SNESRECOMP_ROM` sets the path once for a
-shell. `tools/regen.sh` also finds `@ROM_FILE@` at the repo root if you
-prefer that; `.gitignore` blocks it from ever being committed either way.
+shell. Without either, `tools/regen.sh` finds `@ROM_FILE@` at the repo root,
+then the path the setup wizard recorded in `rom.cfg`; `.gitignore` blocks
+both from ever being committed.
 
 `tools/regen.sh` verifies the ROM, generates `src/gen/*.c`, and re-syncs
 `recomp/funcs.h`. Re-run it whenever you change anything under `recomp/`.
@@ -86,13 +87,16 @@ than mis-executing ten frames in.
 
 The scaffold stops where the game-specific work starts. In rough order:
 
-1. **Make it boot.** `src/game_rtl.c` holds the frame driver. The generic
-   LLE-first shape is there; a real title usually needs a frame boundary and
-   NMI delivery that understand its own main loop. This is the bulk of the
-   work.
+1. **Make it boot.** `src/game_rtl.c` holds the frame driver. It starts on
+   the framework's beam-aligned driver (`snesrecomp/runner/src/beam_frame_driver.h`):
+   one frame per PPU field, interrupts taken where the beam latches them,
+   the field rasterized from the raster journal. A title whose main loop it
+   does not fit replaces those calls with its own driver.
 2. **Name things.** Add entries to `recomp/symbols.toml` as you identify
    routines, then re-run `tools/regen.sh`. Set `emit = true` to promote one
-   into ahead-of-time codegen; leave it false to keep it interpreted.
+   into ahead-of-time analysis; leave it false to keep it interpreted.
+   Regen synchronizes the marked blocks in each bank cfg, creating missing
+   configs. Only proven variants become AOT code. See `recomp/README.md`.
 3. **Resolve dispatch misses.** After every run, deal with unresolved
    indirect targets before anything else — they are the reason a port
    diverges, and they are cheap to fix early.

@@ -9,6 +9,8 @@
 //! keyed decode cache is a Phase 5 concern; correctness lives in the uncached
 //! walk.
 
+mod pointer_recovery;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -128,6 +130,8 @@ pub struct ConstZFold {
 #[derive(Debug, Clone, Default)]
 pub struct FunctionDecodeGraph {
     pub entry: Option<DecodeKey>,
+    pub authority_conflict: bool,
+    pub rom_mapping: RomMapping,
     insns_vec: Vec<DecodedInsn>,
     index: HashMap<DecodeKey, usize>,
     pub suppressed_indirect_calls: Vec<SuppressedIndirectCall>,
@@ -205,16 +209,23 @@ impl FunctionDecodeGraph {
 #[derive(Debug, Clone, Default)]
 pub struct DecodeEnv<'a> {
     pub rom_mapping: RomMapping,
+    pub rom_image_size: Option<usize>,
     /// Per-function decode budget. `None` preserves the public default.
     pub max_insns: Option<usize>,
     pub dispatch_helpers: Option<&'a HashMap<u32, String>>, // target_pc24 -> 'short'|'long'
     pub indirect_call_tables: Option<&'a HashMap<u32, IndirectCallTable>>,
     pub indirect_dispatch: Option<&'a HashMap<u32, IndirectDispatchSite>>,
     pub hle_dispatch: Option<&'a HashMap<u32, String>>,
+    pub authority_bytes: Option<&'a HashMap<u32, Vec<u8>>>,
+    pub authority_data: Option<&'a HashMap<u32, Vec<bool>>>,
     pub data_regions: Option<&'a [(u32, u32, u32)]>, // (bank, start, end_excl)
     pub callee_exit_mx: Option<&'a HashMap<(u32, u8, u8), (u8, u8)>>,
     pub callee_exit_mx_modes: Option<&'a HashMap<(u32, u8, u8), Vec<(u8, u8)>>>,
     pub sibling_entry_pcs: Option<&'a std::collections::BTreeSet<u32>>,
+    /// 16-bit PCs in this bank replaced by a host implementation (cfg
+    /// `hle_func` / `hle_spc_upload`). Never decoded into another function:
+    /// every non-entry edge onto one is a boundary exit (tail transfer).
+    pub hle_entry_pcs: Option<&'a std::collections::BTreeSet<u32>>,
     pub reloc_regions: Option<&'a [RelocRegion]>,
     pub callee_inline_skip: Option<&'a HashMap<u32, i32>>,
     pub inline_dispatch_loop_pcs: Option<&'a std::collections::BTreeSet<u32>>,
@@ -367,6 +378,52 @@ fn addr_in_data_regions(data_regions: Option<&[(u32, u32, u32)]>, bank: u32, pc1
     false
 }
 
+/// The cfg `data_region` (bank, start, end_excl) covering (bank, pc16), or
+/// None. First match in declaration order; region fields compared as
+/// declared, like `_data_region_containing`.
+fn data_region_containing(
+    data_regions: Option<&[(u32, u32, u32)]>,
+    bank: u32,
+    pc16: u32,
+) -> Option<(u32, u32, u32)> {
+    let pc16 = pc16 & 0xFFFF;
+    data_regions?
+        .iter()
+        .copied()
+        .find(|&(b, s, e)| b == bank && s <= pc16 && pc16 < e)
+}
+
+/// The cfg `data_region` that STARTS exactly at (bank, pc16), or None. First
+/// match in declaration order. Port of `_data_region_starting_at`.
+fn data_region_starting_at(
+    data_regions: Option<&[(u32, u32, u32)]>,
+    bank: u32,
+    pc16: u32,
+) -> Option<(u32, u32, u32)> {
+    let pc16 = pc16 & 0xFFFF;
+    data_regions?
+        .iter()
+        .copied()
+        .find(|&(b, s, _)| b == bank && s == pc16)
+}
+
+/// Byte boundary of an inline (JSL/JML dispatch-helper) table declared by a
+/// cfg `data_region` that begins exactly at the table and spans a whole
+/// number of entries; the smallest such end wins. Port of the Python
+/// decoder's `table_end`.
+fn declared_inline_table_end(
+    data_regions: Option<&[(u32, u32, u32)]>,
+    bank: u32,
+    tbl_pc: u32,
+    entry_size: u32,
+) -> Option<u32> {
+    data_regions?
+        .iter()
+        .filter(|&&(b, s, e)| b == bank && s == tbl_pc && e > s && (e - s) % entry_size == 0)
+        .map(|&(_, _, e)| e)
+        .min()
+}
+
 // ── Auto-recovery for indirect dispatch ───────────────────────────────────
 
 /// Resolved indirect-dispatch authorisation (cfg directive or auto-recovered).
@@ -404,8 +461,30 @@ fn autorecover_indirect_xtable(
     let base = insn.operand & 0xFFFF;
     let entry_size: u32 = if is_long_dispatch(insn, &[]) { 3 } else { 2 };
     let max_entries = 256usize;
+    // The operand is the address the index is added to, not necessarily
+    // entry 0. Where the cfg `data_region` overlay proves the table starts
+    // after the operand byte (Yoshi's Island `JSR ($DE84,X)` with its table
+    // at $DE85), align the walk to the region; and bound it by the region's
+    // end, since an entry past a declared data span is code bytes read as a
+    // pointer. Port of the Python `index_bias` / `region_end` logic; the bias
+    // itself only matters to codegen, the aligned targets matter here.
+    let mut index_bias = 0u32;
+    let mut region_end: Option<u32> = None;
+    if let Some(region) = data_region_containing(data_regions, bank, base) {
+        region_end = Some(region.2);
+    } else {
+        for delta in 1..entry_size {
+            if let Some(region) =
+                data_region_starting_at(data_regions, bank, (base + delta) & 0xFFFF)
+            {
+                index_bias = delta;
+                region_end = Some(region.2);
+                break;
+            }
+        }
+    }
     let mut entries: Vec<u32> = Vec::new();
-    let mut tbl_pc = base;
+    let mut tbl_pc = (base + index_bias) & 0xFFFF;
     let mut nulls_in_a_row = 0;
     let code_boundary: Option<u32> = if base < (func_start & 0xFFFF) {
         Some(func_start & 0xFFFF)
@@ -419,6 +498,11 @@ fn autorecover_indirect_xtable(
         }
         if let Some(cb) = code_boundary {
             if tbl_pc >= cb {
+                break;
+            }
+        }
+        if let Some(re) = region_end {
+            if tbl_pc + entry_size > re {
                 break;
             }
         }
@@ -578,193 +662,6 @@ fn autorecover_local_stride_runway(
 
 /// Walk back from func start to find the LDA/STA pairs that compose a DP
 /// dispatch pointer. Port of `_autorecover_indirect_dp`.
-fn autorecover_indirect_dp(
-    rom: &[u8],
-    mapping: RomMapping,
-    bank: u32,
-    func_start: u32,
-    site_pc: u32,
-    dp_addr: u32,
-    insn_length: u8,
-    reloc: &[RelocRegion],
-) -> Option<(Vec<u32>, char)> {
-    let mut winners: HashMap<i64, (u32, char)> = HashMap::new();
-    let mut pc = func_start & 0xFFFF;
-    let mut m_state = 1u8;
-    let mut x_state = 1u8;
-    let mut last_lda_table: Option<(u32, char)> = None;
-    let mut scanned = 0;
-    let max_scan = 256;
-    while pc < site_pc && scanned < max_scan {
-        let off = try_rom_offset(mapping, bank, pc, reloc)?;
-        if off >= rom.len() {
-            return None;
-        }
-        let insn = decode_insn(rom, off, pc, bank, m_state, x_state)?;
-        let mnem = insn.mnem;
-        if mnem == "REP" {
-            if insn.operand & 0x20 != 0 {
-                m_state = 0;
-            }
-            if insn.operand & 0x10 != 0 {
-                x_state = 0;
-            }
-        } else if mnem == "SEP" {
-            if insn.operand & 0x20 != 0 {
-                m_state = 1;
-            }
-            if insn.operand & 0x10 != 0 {
-                x_state = 1;
-            }
-        }
-        if mnem == "LDA" && (insn.mode == Mode::AbsX || insn.mode == Mode::LongX) {
-            last_lda_table = Some((insn.operand & 0xFFFF, 'X'));
-        } else if mnem == "LDA" && insn.mode == Mode::AbsY {
-            last_lda_table = Some((insn.operand & 0xFFFF, 'Y'));
-        } else if mnem == "STA" && insn.mode == Mode::Dp {
-            let slot = (insn.operand & 0xFFFF) as i64 - (dp_addr & 0xFFFF) as i64;
-            if (0..=2).contains(&slot) {
-                if let Some(lda) = last_lda_table.take() {
-                    winners.insert(slot, lda);
-                }
-            }
-        } else if mnem == "STA" || mnem == "STZ" {
-            let slot = (insn.operand & 0xFFFF) as i64 - (dp_addr & 0xFFFF) as i64;
-            if (0..=2).contains(&slot) {
-                winners.remove(&slot);
-            }
-        } else if mnem == "LDA" {
-            last_lda_table = None;
-        }
-        scanned += 1;
-        pc = (pc + insn.length as u32) & 0xFFFF;
-    }
-
-    if winners.is_empty() {
-        return None;
-    }
-    let idx_regs: HashSet<char> = winners.values().map(|w| w.1).collect();
-    if idx_regs.len() != 1 {
-        return None;
-    }
-    let idx_reg = *idx_regs.iter().next().unwrap();
-    let needed_slots = if insn_length == 3 && m_state == 1 && winners.contains_key(&2) {
-        3
-    } else if winners.contains_key(&1) {
-        2
-    } else {
-        1
-    };
-    let mut table_bases = Vec::new();
-    for s in 0..needed_slots {
-        let winner = winners.get(&(s as i64))?;
-        table_bases.push(winner.0);
-    }
-    Some((table_bases, idx_reg))
-}
-
-/// Count valid entries in a DP-pointer dispatch's parallel byte-tables. Port of
-/// `_autorecover_dp_table_count`.
-fn autorecover_dp_table_count(
-    rom: &[u8],
-    mapping: RomMapping,
-    bank: u32,
-    table_bases: &[u32],
-    data_regions: Option<&[(u32, u32, u32)]>,
-    reloc: &[RelocRegion],
-) -> Option<u32> {
-    if table_bases.is_empty() {
-        return None;
-    }
-    let max_entries = 256u32;
-    if table_bases.len() == 1 {
-        let base = table_bases[0] & 0xFFFF;
-        let mut count = 0u32;
-        for i in 0..max_entries {
-            let tbl_pc = (base + 2 * i) & 0xFFFF;
-            if tbl_pc + 1 > 0xFFFF {
-                break;
-            }
-            let off = match try_rom_offset(mapping, bank, tbl_pc, reloc) {
-                Some(o) => o,
-                None => break,
-            };
-            if off + 1 >= rom.len() {
-                break;
-            }
-            let addr16 = rom[off] as u32 | ((rom[off + 1] as u32) << 8);
-            if addr16 == 0 {
-                break;
-            }
-            if addr16 < 0x8000 {
-                break;
-            }
-            if addr_in_data_regions(data_regions, bank, addr16) {
-                break;
-            }
-            if dispatch_target_is_padding(rom, mapping, bank, addr16, reloc) {
-                break;
-            }
-            count += 1;
-        }
-        return if count > 0 { Some(count) } else { None };
-    }
-    let lo_base = table_bases[0] & 0xFFFF;
-    let hi_base = table_bases[1] & 0xFFFF;
-    let bk_base = if table_bases.len() >= 3 {
-        Some(table_bases[2] & 0xFFFF)
-    } else {
-        None
-    };
-    let mut count = 0u32;
-    for i in 0..max_entries {
-        let lo_off = match try_rom_offset(mapping, bank, (lo_base + i) & 0xFFFF, reloc) {
-            Some(o) => o,
-            None => break,
-        };
-        let hi_off = match try_rom_offset(mapping, bank, (hi_base + i) & 0xFFFF, reloc) {
-            Some(o) => o,
-            None => break,
-        };
-        if lo_off.max(hi_off) >= rom.len() {
-            break;
-        }
-        let lo = rom[lo_off] as u32;
-        let hi = rom[hi_off] as u32;
-        let eb = if let Some(bk) = bk_base {
-            let bk_off = match try_rom_offset(mapping, bank, (bk + i) & 0xFFFF, reloc) {
-                Some(o) => o,
-                None => break,
-            };
-            if bk_off >= rom.len() {
-                break;
-            }
-            rom[bk_off] as u32
-        } else {
-            bank
-        };
-        let addr16 = (hi << 8) | lo;
-        if addr16 == 0 {
-            break;
-        }
-        if addr16 < 0x8000 {
-            break;
-        }
-        if addr_in_data_regions(data_regions, eb, addr16) {
-            break;
-        }
-        if dispatch_target_is_padding(rom, mapping, eb, addr16, reloc) {
-            break;
-        }
-        count += 1;
-    }
-    if count > 0 {
-        Some(count)
-    } else {
-        None
-    }
-}
-
 /// Read N dispatch targets from ROM per an `Auth`. Port of
 /// `_resolve_indirect_dispatch_targets`.
 fn resolve_indirect_dispatch_targets(
@@ -890,6 +787,7 @@ fn labeled_successors(
     _rom: &[u8],
     unknown_callee_exit_sites: &mut Vec<(u32, u32, u8, u8)>,
 ) -> Vec<(DecodeKey, &'static str)> {
+    let mapping = env.rom_mapping;
     let (post_m, post_x, post_p_stack) = post_state(insn, key.m, key.x, &key.p_stack);
     let pc = insn.addr & 0xFFFF;
     let next_pc = (pc + insn.length as u32) & 0xFFFF;
@@ -952,7 +850,7 @@ fn labeled_successors(
             let mut skip = map.get(&tp).copied();
             if skip.is_none() {
                 let tbank = (tp >> 16) & 0xFF;
-                if tbank < 0x40 || (0x80..0xC0).contains(&tbank) {
+                if mapping != RomMapping::Sa1 && (tbank < 0x40 || (0x80..0xC0).contains(&tbank)) {
                     skip = map.get(&(tp ^ 0x800000)).copied();
                 }
             }
@@ -968,7 +866,8 @@ fn labeled_successors(
                 let mut hit = cem.get(&(tp, post_m, post_x)).copied();
                 if hit.is_none() {
                     let tbank = (tp >> 16) & 0xFF;
-                    if tbank < 0x40 || (0x80..0xC0).contains(&tbank) {
+                    if mapping != RomMapping::Sa1 && (tbank < 0x40 || (0x80..0xC0).contains(&tbank))
+                    {
                         hit = cem.get(&(tp ^ 0x800000, post_m, post_x)).copied();
                     }
                 }
@@ -984,7 +883,8 @@ fn labeled_successors(
                 let mut mode_set: Option<Vec<(u8, u8)>> = cmm.get(&(tp, post_m, post_x)).cloned();
                 if mode_set.is_none() {
                     let tbank = (tp >> 16) & 0xFF;
-                    if tbank < 0x40 || (0x80..0xC0).contains(&tbank) {
+                    if mapping != RomMapping::Sa1 && (tbank < 0x40 || (0x80..0xC0).contains(&tbank))
+                    {
                         mode_set = cmm.get(&(tp ^ 0x800000, post_m, post_x)).cloned();
                     }
                 }
@@ -1059,6 +959,7 @@ pub fn decode_function(
     let entry_x = entry_x & 1;
     let entry_key = DecodeKey::new(addr24(bank, start), entry_m, entry_x);
     let mut graph = FunctionDecodeGraph::new(entry_key.clone());
+    graph.rom_mapping = mapping;
 
     let mut inline_loop_sites: HashSet<u32> = HashSet::new();
     if let Some(s) = env.inline_dispatch_loop_pcs {
@@ -1098,6 +999,19 @@ pub fn decode_function(
                 continue;
             }
         }
+        // An HLE-replaced PC is never part of another function's body: every
+        // edge onto it (jump, fall-through, local computed goto, imported
+        // territory, inside an explicit end: range) is a tail transfer to its
+        // host stub. Mirrors the Python decoder's identical gate.
+        if let Some(hle) = env.hle_entry_pcs {
+            if edge_kind != "entry" && pc != (start & 0xFFFF) && hle.contains(&pc) {
+                let boundary = (addr24(bank, (pred_pc as u32) & 0xFFFF), key.clone());
+                if !graph.boundary_exits.contains(&boundary) {
+                    graph.boundary_exits.push(boundary);
+                }
+                continue;
+            }
+        }
         // Jump edge onto a named sibling function entry.
         if let Some(sib) = env.sibling_entry_pcs {
             if edge_kind == "jump" && sib.contains(&pc) && !pred_in_territory {
@@ -1117,7 +1031,9 @@ pub fn decode_function(
             Some(o) => o,
             None => continue,
         };
-        if offset >= rom.len() {
+        if offset >= rom.len()
+            || (!in_reloc && env.rom_image_size.is_some_and(|size| offset >= size))
+        {
             continue;
         }
         if addr_in_data_regions(data_regions, bank, pc) {
@@ -1126,6 +1042,29 @@ pub fn decode_function(
 
         let mut insn = decode_insn(rom, offset, pc, bank, key.m, key.x)
             .unwrap_or_else(|| panic!("v2 decoder: unknown opcode at ${bank:02X}:{pc:04X}"));
+        if env
+            .authority_data
+            .and_then(|data| data.get(&bank))
+            .is_some_and(|mask| {
+                (pc..(pc + insn.length as u32).min(0x10000)).any(|p| mask[p as usize])
+            })
+        {
+            graph.authority_conflict = true;
+            continue;
+        }
+        if let Some(authority) = env.authority_bytes {
+            let size = insn.length as usize;
+            if authority.get(&key.pc).is_some_and(|raw| {
+                raw.len() != size || rom.get(offset..offset + size) != Some(raw.as_slice())
+            }) || (1..size).any(|n| {
+                authority
+                    .get(&(key.pc + n as u32))
+                    .is_some_and(|r| !r.is_empty())
+            }) {
+                graph.authority_conflict = true;
+                continue;
+            }
+        }
         insn.m_flag = key.m;
         insn.x_flag = key.x;
         if env
@@ -1152,7 +1091,19 @@ pub fn decode_function(
             let entry_size: u32 = if hk == "long" { 3 } else { 2 };
             let mut entries: Vec<u32> = Vec::new();
             let mut tbl_pc = (pc + insn.length as u32) & 0xFFFF;
+            // A data region beginning exactly at the inline table supplies
+            // its byte boundary. An unused slot targeting data inside that
+            // boundary is not the end of the table (SMW sprite $36 precedes
+            // valid sprites $37..$C8). Keep its index/target, while the
+            // normal data-region gate still prevents compiling that target as
+            // code. Port of the Python decoder's `table_end`.
+            let table_end = declared_inline_table_end(data_regions, bank, tbl_pc, entry_size);
             while entries.len() < 256 && tbl_pc + entry_size - 1 <= 0xFFFF {
+                if let Some(te) = table_end {
+                    if tbl_pc + entry_size > te {
+                        break;
+                    }
+                }
                 // Bound the inline dispatch table at the next declared function
                 // entry. A sibling entry marks the start of the following
                 // routine, so its bytes cannot also be table data; without this
@@ -1207,7 +1158,9 @@ pub fn decode_function(
                                 reason: "data_region".to_string(),
                                 table_index: entries.len() as u32,
                             });
-                        break;
+                        if table_end.is_none() {
+                            break;
+                        }
                     }
                     entries.push((eb << 16) | addr16);
                 } else {
@@ -1231,7 +1184,9 @@ pub fn decode_function(
                                 reason: "data_region".to_string(),
                                 table_index: entries.len() as u32,
                             });
-                        break;
+                        if table_end.is_none() {
+                            break;
+                        }
                     }
                     entries.push(addr16);
                 }
@@ -1296,37 +1251,28 @@ pub fn decode_function(
             if auth.is_none() && insn.mode == Mode::Indir {
                 let dp_op = insn.operand & 0xFFFF;
                 if dp_op <= 0x00FF {
-                    if let Some((table_bases, idx_reg)) = autorecover_indirect_dp(
+                    if let Some(targets) = pointer_recovery::recover(
                         rom,
                         mapping,
-                        bank,
-                        start,
-                        pc,
+                        &graph,
+                        &key,
                         dp_op,
-                        insn.length,
+                        insn.opcode == 0xDC,
+                        data_regions,
                         reloc,
                     ) {
-                        if let Some(count) = autorecover_dp_table_count(
-                            rom,
-                            mapping,
-                            bank,
-                            &table_bases,
-                            data_regions,
-                            reloc,
-                        ) {
-                            auth = Some(Auth {
-                                count,
-                                idx_reg,
-                                table_bases,
-                                ptr_call: false,
-                                return_pc: None,
-                                frame_size: None,
-                                pointer_match: false,
-                                popped_call_frame: false,
-                                targets: vec![],
-                                local_goto: false,
-                            });
-                        }
+                        auth = Some(Auth {
+                            count: targets.len() as u32,
+                            idx_reg: 'X',
+                            table_bases: vec![],
+                            ptr_call: false,
+                            return_pc: None,
+                            frame_size: None,
+                            pointer_match: true,
+                            popped_call_frame: false,
+                            targets,
+                            local_goto: false,
+                        });
                     }
                 }
             }
@@ -1344,9 +1290,17 @@ pub fn decode_function(
                 if rom_ok {
                     let tbl_off = try_rom_offset(mapping, bank, tbl_pc, reloc).unwrap();
                     let tgt16 = rom[tbl_off] as u32 | ((rom[tbl_off + 1] as u32) << 8);
+                    // A 24-bit `JML [abs]` pointer names its own bank; gate
+                    // the target where it actually lives (as the Python
+                    // decoder does), not in the site's bank.
+                    let tgt_bank = if need == 3 {
+                        rom[tbl_off + 2] as u32
+                    } else {
+                        bank
+                    };
                     if tgt16 >= 0x8000
-                        && !addr_in_data_regions(data_regions, bank, tgt16)
-                        && !dispatch_target_is_padding(rom, mapping, bank, tgt16, reloc)
+                        && !addr_in_data_regions(data_regions, tgt_bank, tgt16)
+                        && !dispatch_target_is_padding(rom, mapping, tgt_bank, tgt16, reloc)
                     {
                         auth = Some(Auth {
                             count: 1,
@@ -1435,18 +1389,24 @@ pub fn decode_function(
                     let site_m = insn.m_flag & 1;
                     let site_x = insn.x_flag & 1;
                     let mut extra_succs: Vec<(DecodeKey, &'static str)> = Vec::new();
-                    for &e in &entries {
-                        if e == 0 {
-                            continue;
-                        }
-                        let eb = (e >> 16) & 0xFF;
-                        let e16 = e & 0xFFFF;
-                        if eb == bank
-                            && ((0x8000..=0xFFFF).contains(&e16)
-                                || addr_in_reloc_region(eb, e16, reloc).is_some())
-                        {
-                            extra_succs
-                                .push((DecodeKey::new(addr24(eb, e16), site_m, site_x), "jump"));
+                    // Ptrcall handlers are separate call demands. Importing
+                    // their RTSes contaminates this routine's exit widths.
+                    if !auth.ptr_call {
+                        for &e in &entries {
+                            if e == 0 {
+                                continue;
+                            }
+                            let eb = (e >> 16) & 0xFF;
+                            let e16 = e & 0xFFFF;
+                            if eb == bank
+                                && ((0x8000..=0xFFFF).contains(&e16)
+                                    || addr_in_reloc_region(eb, e16, reloc).is_some())
+                            {
+                                extra_succs.push((
+                                    DecodeKey::new(addr24(eb, e16), site_m, site_x),
+                                    "jump",
+                                ));
+                            }
                         }
                     }
                     let succ: Vec<DecodeKey> = if auth.ptr_call {
@@ -1460,9 +1420,55 @@ pub fn decode_function(
                                 reloc,
                             )
                         }) & 0xFFFF;
-                        let next = DecodeKey::new(addr24(bank, next_pc), site_m, site_x);
-                        extra_succs.push((next.clone(), "fall"));
-                        vec![next]
+                        let mut return_modes = HashSet::new();
+                        let mut missing_targets = Vec::new();
+                        for &entry in &entries {
+                            if entry == 0 {
+                                continue;
+                            }
+                            let target = if insn.dispatch_kind.as_deref() == Some("long") {
+                                entry & 0xFFFFFF
+                            } else {
+                                addr24(bank, entry & 0xFFFF)
+                            };
+                            match lookup_exit_mx_modes(
+                                mapping,
+                                env.callee_exit_mx,
+                                env.callee_exit_mx_modes,
+                                target,
+                                site_m,
+                                site_x,
+                            ) {
+                                Some(modes) => return_modes.extend(modes),
+                                None => missing_targets.push(target),
+                            }
+                        }
+                        if !missing_targets.is_empty() && env.stop_on_unknown_callee_exit {
+                            for target in missing_targets {
+                                let item = (insn.addr & 0xFFFFFF, target, site_m, site_x);
+                                if !graph.unknown_callee_exit_sites.contains(&item) {
+                                    graph.unknown_callee_exit_sites.push(item);
+                                }
+                            }
+                        } else {
+                            if !missing_targets.is_empty() || return_modes.is_empty() {
+                                return_modes.insert((site_m, site_x));
+                            }
+                            let mut modes: Vec<_> = return_modes.into_iter().collect();
+                            modes.sort();
+                            for (m, x) in modes {
+                                extra_succs.push((
+                                    DecodeKey::with_stack(
+                                        addr24(bank, next_pc),
+                                        m,
+                                        x,
+                                        key.p_stack.clone(),
+                                    ),
+                                    "fall",
+                                ));
+                            }
+                        }
+                        extra_succs.iter().map(|(next, _)| next.clone()).collect()
                     } else {
                         extra_succs.iter().map(|(k, _)| k.clone()).collect()
                     };
@@ -1715,6 +1721,7 @@ pub fn decode_function(
                             addr24(bank, e & 0xFFFF)
                         };
                         match lookup_exit_mx_modes(
+                            mapping,
                             env.callee_exit_mx,
                             env.callee_exit_mx_modes,
                             target_pc24,
@@ -2427,6 +2434,7 @@ pub fn function_exit_mx_equation(
 }
 
 fn lookup_exit_mx(
+    mapping: RomMapping,
     callee_exit_mx: Option<&HashMap<(u32, u8, u8), (u8, u8)>>,
     pc24: u32,
     m: u8,
@@ -2436,7 +2444,7 @@ fn lookup_exit_mx(
     let key = (pc24 & 0xFFFFFF, m & 1, x & 1);
     map.get(&key).copied().or_else(|| {
         let bank = (pc24 >> 16) & 0xFF;
-        if bank < 0x40 || (0x80..0xC0).contains(&bank) {
+        if mapping != RomMapping::Sa1 && (bank < 0x40 || (0x80..0xC0).contains(&bank)) {
             map.get(&((pc24 ^ 0x800000) & 0xFFFFFF, m & 1, x & 1))
                 .copied()
         } else {
@@ -2446,20 +2454,21 @@ fn lookup_exit_mx(
 }
 
 fn lookup_exit_mx_modes(
+    mapping: RomMapping,
     callee_exit_mx: Option<&HashMap<(u32, u8, u8), (u8, u8)>>,
     callee_exit_mx_modes: Option<&HashMap<(u32, u8, u8), Vec<(u8, u8)>>>,
     pc24: u32,
     m: u8,
     x: u8,
 ) -> Option<Vec<(u8, u8)>> {
-    if let Some(exact) = lookup_exit_mx(callee_exit_mx, pc24, m, x) {
+    if let Some(exact) = lookup_exit_mx(mapping, callee_exit_mx, pc24, m, x) {
         return Some(vec![(exact.0 & 1, exact.1 & 1)]);
     }
     let map = callee_exit_mx_modes?;
     let key = (pc24 & 0xFFFFFF, m & 1, x & 1);
     let mut result = map.get(&key).cloned().or_else(|| {
         let bank = (pc24 >> 16) & 0xFF;
-        if bank < 0x40 || (0x80..0xC0).contains(&bank) {
+        if mapping != RomMapping::Sa1 && (bank < 0x40 || (0x80..0xC0).contains(&bank)) {
             map.get(&((pc24 ^ 0x800000) & 0xFFFFFF, m & 1, x & 1))
                 .cloned()
         } else {
@@ -2480,6 +2489,7 @@ pub fn analyze_function_exit_mx(
     graph: &FunctionDecodeGraph,
     callee_exit_mx: Option<&HashMap<(u32, u8, u8), (u8, u8)>>,
 ) -> (Option<u8>, Option<u8>) {
+    let mapping = graph.rom_mapping;
     fn accumulate(
         em: u8,
         ex: u8,
@@ -2534,7 +2544,9 @@ pub fn analyze_function_exit_mx(
         let tail_keys = direct_tail_exit_keys(graph, di);
         if !tail_keys.is_empty() {
             for (target, site_m, site_x) in tail_keys {
-                let Some((em, ex)) = lookup_exit_mx(callee_exit_mx, target, site_m, site_x) else {
+                let Some((em, ex)) =
+                    lookup_exit_mx(mapping, callee_exit_mx, target, site_m, site_x)
+                else {
                     return (None, None);
                 };
                 accumulate(
@@ -2587,7 +2599,8 @@ pub fn analyze_function_exit_mx(
     }
 
     for (_, target) in &graph.boundary_exits {
-        let Some((em, ex)) = lookup_exit_mx(callee_exit_mx, target.pc, target.m, target.x) else {
+        let Some((em, ex)) = lookup_exit_mx(mapping, callee_exit_mx, target.pc, target.m, target.x)
+        else {
             return (None, None);
         };
         accumulate(
@@ -2629,6 +2642,7 @@ pub fn analyze_function_exit_mx_modes_with_sets(
     callee_exit_mx: Option<&HashMap<(u32, u8, u8), (u8, u8)>>,
     callee_exit_mx_modes: Option<&HashMap<(u32, u8, u8), Vec<(u8, u8)>>>,
 ) -> Option<Vec<(u8, u8)>> {
+    let mapping = graph.rom_mapping;
     let return_states = return_stack_delta_states(graph);
     if has_unproven_nonlocal_return(graph, &return_states) {
         return None;
@@ -2647,6 +2661,7 @@ pub fn analyze_function_exit_mx_modes_with_sets(
         if !tail_keys.is_empty() {
             for (target, site_m, site_x) in tail_keys {
                 modes.extend(lookup_exit_mx_modes(
+                    mapping,
                     callee_exit_mx,
                     callee_exit_mx_modes,
                     target,
@@ -2674,6 +2689,7 @@ pub fn analyze_function_exit_mx_modes_with_sets(
                     (dispatcher_bank << 16) | (entry & 0xFFFF)
                 };
                 modes.extend(lookup_exit_mx_modes(
+                    mapping,
                     callee_exit_mx,
                     callee_exit_mx_modes,
                     tgt_pc24,
@@ -2686,6 +2702,7 @@ pub fn analyze_function_exit_mx_modes_with_sets(
 
     for (_, target) in &graph.boundary_exits {
         modes.extend(lookup_exit_mx_modes(
+            mapping,
             callee_exit_mx,
             callee_exit_mx_modes,
             target.pc,
@@ -3364,26 +3381,25 @@ pub(crate) fn compute_deps(
     let mut sib_pcs: Vec<u32> = Vec::new();
     for di in graph.insns() {
         let ins = &di.insn;
-        let dispatch_targets: Vec<u32> =
-            if ins.mnem == "JSR" && ins.mode == Mode::IndirX && ins.dispatch_entries.is_some() {
-                let bank = (ins.addr >> 16) & 0xFF;
-                ins.dispatch_entries
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .copied()
-                    .filter(|entry| *entry != 0)
-                    .map(|entry| {
-                        if ins.dispatch_kind.as_deref() == Some("long") {
-                            entry & 0xFFFFFF
-                        } else {
-                            addr24(bank, entry & 0xFFFF)
-                        }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let dispatch_targets: Vec<u32> = if ins.dispatch_call && ins.dispatch_entries.is_some() {
+            let bank = (ins.addr >> 16) & 0xFF;
+            ins.dispatch_entries
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .filter(|entry| *entry != 0)
+                .map(|entry| {
+                    if ins.dispatch_kind.as_deref() == Some("long") {
+                        entry & 0xFFFFFF
+                    } else {
+                        addr24(bank, entry & 0xFFFF)
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let tp: Option<u32> = if ins.mnem == "JSR" && ins.length == 3 && ins.mode != Mode::IndirX {
             Some(addr24((ins.addr >> 16) & 0xFF, ins.operand & 0xFFFF))
         } else if ins.mnem == "JSL" {
@@ -3394,14 +3410,18 @@ pub(crate) fn compute_deps(
         if let Some(tp) = tp {
             cem_keys.push((tp, ins.m_flag, ins.x_flag));
             let tbank = (tp >> 16) & 0xFF;
-            if tbank < 0x40 || (0x80..0xC0).contains(&tbank) {
+            if graph.rom_mapping != RomMapping::Sa1
+                && (tbank < 0x40 || (0x80..0xC0).contains(&tbank))
+            {
                 cem_keys.push((tp ^ 0x800000, ins.m_flag, ins.x_flag));
             }
         }
         for tp in dispatch_targets {
             cem_keys.push((tp, ins.m_flag, ins.x_flag));
             let tbank = (tp >> 16) & 0xFF;
-            if tbank < 0x40 || (0x80..0xC0).contains(&tbank) {
+            if graph.rom_mapping != RomMapping::Sa1
+                && (tbank < 0x40 || (0x80..0xC0).contains(&tbank))
+            {
                 cem_keys.push((tp ^ 0x800000, ins.m_flag, ins.x_flag));
             }
         }
@@ -4322,6 +4342,38 @@ mod tests {
     }
 
     #[test]
+    fn hle_pc_is_a_boundary_for_fall_through_and_in_range_jumps() {
+        // $8000: NOP ; NOP falls into $8002 (hle). $8010: BRA $8002 from a
+        // function whose explicit end: range covers the hle PC.
+        let mut bytes = vec![0xEAu8; 0x14];
+        bytes[2] = 0xA9; // $8002: LDA #$01 ; RTS (replaced bytes)
+        bytes[3] = 0x01;
+        bytes[4] = 0x60;
+        bytes[0x10] = 0x80; // $8010: BRA $8002
+        bytes[0x11] = 0xF0;
+        let rom = rom_at_8000(&bytes);
+        let hle = std::collections::BTreeSet::from([0x8002u32]);
+        let env = DecodeEnv {
+            hle_entry_pcs: Some(&hle),
+            ..DecodeEnv::default()
+        };
+        let fall = decode_function(&rom, 0, 0x8000, 1, 1, None, &env);
+        assert!(fall.get(&k(0x8002)).is_none());
+        assert_eq!(fall.boundary_exits, vec![(0x008001, k(0x8002))]);
+        let ranged = decode_function(&rom, 0, 0x8010, 1, 1, Some(0x8014), &env);
+        assert!(ranged.get(&k(0x8002)).is_none());
+        assert_eq!(ranged.boundary_exits, vec![(0x008010, k(0x8002))]);
+        // The replaced routine's own decode (analysis of its ROM body) is
+        // not cut at its own entry.
+        let own = decode_function(&rom, 0, 0x8002, 1, 1, None, &env);
+        assert!(own.get(&k(0x8002)).is_some());
+        assert!(own.boundary_exits.is_empty());
+        // Without the HLE declaration the bytes are imported, as before.
+        let plain = decode_function(&rom, 0, 0x8000, 1, 1, None, &DecodeEnv::default());
+        assert!(plain.get(&k(0x8002)).is_some());
+    }
+
+    #[test]
     fn ptrcall_explicit_return_overrides_non_adjacent_pea_detection() {
         let mut bytes = vec![0u8; 0x12];
         bytes[0..4].copy_from_slice(&[0xEA, 0x6C, 0x10, 0x00]);
@@ -4619,5 +4671,230 @@ mod tests {
         let (m, x, s3) = post_state(&plp, m, x, &s2);
         assert_eq!((m, x), (0, 1)); // restored
         assert!(s3.is_empty());
+    }
+
+    /// 32 KiB LoROM bank-0 image; `blobs` maps local PC ($8000+) to bytes.
+    fn lorom_bank0(blobs: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        for &(pc, bytes) in blobs {
+            let off = (pc - 0x8000) as usize;
+            rom[off..off + bytes.len()].copy_from_slice(bytes);
+        }
+        rom
+    }
+
+    /// `JSL $00E000` followed by an inline table of `targets` at $8004.
+    fn inline_table_rom(stride: usize, targets: &[u32]) -> Vec<u8> {
+        let mut site = vec![0x22, 0x00, 0xE0, 0x00];
+        for &t in targets {
+            site.extend_from_slice(&t.to_le_bytes()[..stride]);
+        }
+        let data: Vec<u8> = (0u8..16).collect();
+        lorom_bank0(&[
+            (0x8000, &site),
+            (0x9000, &[0x60]),
+            (0x9100, &[0x60]),
+            (0x9200, &[0x60]),
+            (0x9C70, &data),
+        ])
+    }
+
+    fn inline_dispatch(
+        rom: &[u8],
+        kind: &str,
+        data_regions: &[(u32, u32, u32)],
+    ) -> (Vec<u32>, Vec<DispatchTargetSuppressed>) {
+        let helpers = HashMap::from([(0x00E000u32, kind.to_string())]);
+        let env = DecodeEnv {
+            dispatch_helpers: Some(&helpers),
+            data_regions: Some(data_regions),
+            ..DecodeEnv::default()
+        };
+        let graph = decode_function(rom, 0, 0x8000, 1, 1, None, &env);
+        let jsl = graph.get(&k(0x8000)).unwrap();
+        assert_eq!(jsl.insn.mnem, "JSL");
+        (
+            jsl.insn.dispatch_entries.clone().unwrap_or_default(),
+            graph.dispatch_targets_suppressed.clone(),
+        )
+    }
+
+    /// Mirror of tests/v2/test_decoder_data_region.py
+    /// `test_declared_inline_table_keeps_valid_slots_after_unused_data_target`:
+    /// an unused slot whose target is data does not end a table whose extent
+    /// a `data_region` declares, and a plausible pointer just past that
+    /// declared end is not read.
+    #[test]
+    fn declared_inline_table_keeps_valid_slots_after_unused_data_target() {
+        for (kind, stride) in [("short", 2usize), ("long", 3usize)] {
+            let targets = [0x9000, 0x9C70, 0x9100, 0x9200];
+            let rom = inline_table_rom(stride, &targets);
+            let regions = [(0, 0x8004, 0x8004 + 3 * stride as u32), (0, 0x9C60, 0x9C8E)];
+            let (entries, suppressed) = inline_dispatch(&rom, kind, &regions);
+            assert_eq!(entries, targets[..3].to_vec(), "{kind}");
+            assert_eq!(suppressed.len(), 1, "{kind}");
+            assert_eq!(suppressed[0].table_index, 1, "{kind}");
+            assert_eq!(suppressed[0].target_pc24, 0x9C70, "{kind}");
+            assert_eq!(suppressed[0].site_pc24, 0x8000, "{kind}");
+            assert_eq!(suppressed[0].reason, "data_region", "{kind}");
+        }
+    }
+
+    /// Without a declared table extent the first data-region target still
+    /// terminates the table (`test_dispatch_table_stops_at_data_region_entry`),
+    /// and a region that does not tile whole entries, does not start at the
+    /// table, or lies in another bank is not a declaration.
+    #[test]
+    fn undeclared_inline_table_still_stops_at_data_target() {
+        for (kind, stride) in [("short", 2usize), ("long", 3usize)] {
+            let targets = [0x9000, 0x9C70, 0x9100, 0x9200];
+            let rom = inline_table_rom(stride, &targets);
+            let len = 3 * stride as u32;
+            for table_region in [
+                None,
+                Some((0, 0x8004, 0x8004 + len + 1)),
+                Some((0, 0x8005, 0x8005 + len)),
+                Some((1, 0x8004, 0x8004 + len)),
+            ] {
+                let mut regions = vec![(0, 0x9C60, 0x9C8E)];
+                regions.extend(table_region);
+                let (entries, suppressed) = inline_dispatch(&rom, kind, &regions);
+                assert_eq!(entries, vec![0x9000], "{kind} {table_region:?}");
+                assert_eq!(suppressed.len(), 1, "{kind} {table_region:?}");
+                assert_eq!(suppressed[0].table_index, 1);
+            }
+        }
+    }
+
+    /// The smallest whole-entry region starting at the table bounds it.
+    #[test]
+    fn declared_inline_table_end_takes_smallest_whole_entry_region() {
+        let regions = [
+            (0, 0x8004, 0x800A),
+            (0, 0x8004, 0x8008),
+            (0, 0x8004, 0x8009),
+        ];
+        assert_eq!(
+            declared_inline_table_end(Some(&regions), 0, 0x8004, 2),
+            Some(0x8008)
+        );
+        assert_eq!(
+            declared_inline_table_end(Some(&regions), 0, 0x8004, 3),
+            Some(0x800A)
+        );
+        assert_eq!(declared_inline_table_end(None, 0, 0x8004, 2), None);
+        let rom = inline_table_rom(2, &[0x9000, 0x9100, 0x9200]);
+        let (entries, _) = inline_dispatch(&rom, "short", &regions);
+        assert_eq!(entries, vec![0x9000, 0x9100]);
+    }
+
+    /// Yoshi's Island `JSR ($800C,X)` whose table starts one byte past the
+    /// operand (tests/v2/test_decoder_dispatch_table_alignment.py).
+    fn yi_shaped_rom() -> Vec<u8> {
+        let mut code = vec![
+            0xAE, 0x0F, 0x0D, // $8005 LDX $0D0F
+            0xFC, 0x0C, 0x80, // $8008 JSR ($800C,X)
+            0xAB, // $800B PLB
+            0x6B, // $800C RTL (the operand byte)
+        ];
+        code.extend_from_slice(&[0x93, 0x90, 0xA9, 0x90, 0xD0, 0x90]);
+        let mut handler = vec![0xEAu8; 15];
+        handler.push(0x60);
+        lorom_bank0(&[
+            (0x8005, &code),
+            (0x9093, &handler),
+            (0x90A9, &handler),
+            (0x90D0, &handler),
+            (0x936B, &handler),
+            (0xA990, &handler),
+            (0xD090, &handler),
+        ])
+    }
+
+    fn yi_xtable(rom: &[u8], regions: Option<&[(u32, u32, u32)]>) -> Option<Vec<u32>> {
+        let insn = decode_insn(rom, 0x0008, 0x8008, 0, 1, 1).unwrap();
+        assert_eq!(insn.operand & 0xFFFF, 0x800C);
+        autorecover_indirect_xtable(rom, RomMapping::LoRom, 0, &insn, regions, &[], 0x8005)
+    }
+
+    #[test]
+    fn xtable_aligns_to_data_region_after_operand_byte() {
+        let region = [(0u32, 0x800Du32, 0x8013u32)];
+        assert_eq!(
+            yi_xtable(&yi_shaped_rom(), Some(&region)),
+            Some(vec![0x009093, 0x0090A9, 0x0090D0])
+        );
+        // Without the overlay the walk is one byte low and every decoy passes.
+        let misaligned = yi_xtable(&yi_shaped_rom(), None).unwrap();
+        assert!(misaligned.contains(&0x00936B), "{misaligned:X?}");
+        assert!(!misaligned.contains(&0x009093), "{misaligned:X?}");
+    }
+
+    #[test]
+    fn xtable_stops_at_declared_region_end() {
+        let mut rom = yi_shaped_rom();
+        rom[0x13] = 0xD0; // $8013/$8014 would read as a plausible $90D0
+        rom[0x14] = 0x90;
+        let region = [(0u32, 0x800Du32, 0x8013u32)];
+        assert_eq!(yi_xtable(&rom, Some(&region)).map(|e| e.len()), Some(3));
+    }
+
+    #[test]
+    fn xtable_at_operand_keeps_its_alignment() {
+        let mut handler = vec![0xEAu8; 15];
+        handler.push(0x60);
+        let rom = lorom_bank0(&[
+            (0x8000, &[0xFC, 0x00, 0x90]),
+            (0x9000, &[0x00, 0x91, 0x10, 0x91]),
+            (0x9100, &handler),
+            (0x9110, &handler),
+        ]);
+        let insn = decode_insn(&rom, 0, 0x8000, 0, 1, 1).unwrap();
+        let region = [(0u32, 0x9000u32, 0x9004u32)];
+        for regions in [None, Some(&region[..])] {
+            assert_eq!(
+                autorecover_indirect_xtable(
+                    &rom,
+                    RomMapping::LoRom,
+                    0,
+                    &insn,
+                    regions,
+                    &[],
+                    0x8000
+                ),
+                Some(vec![0x009100, 0x009110])
+            );
+        }
+    }
+
+    /// `JML [$9000]` reads a 24-bit pointer: the data-region gate applies in
+    /// the pointer's own bank, as in the Python decoder.
+    #[test]
+    fn single_target_long_indirect_gates_in_target_bank() {
+        let mut rom = lorom_bank0(&[(0x8000, &[0xDC, 0x00, 0x90]), (0x9000, &[0x00, 0xA0, 0x01])]);
+        rom.resize(0x10000, 0);
+        rom[0x8000 + 0x2000] = 0x60; // $01:A000 RTS
+        let site_bank_region = [(0u32, 0xA000u32, 0xA001u32)];
+        let env = DecodeEnv {
+            data_regions: Some(&site_bank_region),
+            ..DecodeEnv::default()
+        };
+        let graph = decode_function(&rom, 0, 0x8000, 1, 1, None, &env);
+        assert_eq!(
+            graph.get(&k(0x8000)).unwrap().insn.dispatch_entries,
+            Some(vec![0x01A000])
+        );
+        let target_bank_region = [(1u32, 0xA000u32, 0xA001u32)];
+        let env = DecodeEnv {
+            data_regions: Some(&target_bank_region),
+            ..DecodeEnv::default()
+        };
+        let graph = decode_function(&rom, 0, 0x8000, 1, 1, None, &env);
+        assert!(graph
+            .get(&k(0x8000))
+            .unwrap()
+            .insn
+            .dispatch_entries
+            .is_none());
     }
 }

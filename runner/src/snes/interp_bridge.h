@@ -30,6 +30,94 @@
 
 #include <stdint.h>
 #include <stdio.h>
+/* Dump the last n entries of the always-on global interp step ring
+ * (pc/op/sp/frame per interpreted opcode) to `out` (NULL = stderr). */
+void interp_bridge_dump_recent_steps(int n, FILE *out);
+
+/* ── Always-on interpreter control-flow edge ring ───────────────────────
+ * One record per control transfer the interpreter takes. A transfer that
+ * repeats one of the last few records folds into that record's count, so a
+ * spin costs a handful of records however long it runs and the path that
+ * reached it stays readable afterwards. An arrival at a PC is an edge whose
+ * to_pc24 is that PC: query the ring instead of arming a catch. */
+enum {
+    INTERP_EDGE_BRANCH = 1,  /* taken Bcc / BRA / BRL                     */
+    INTERP_EDGE_JUMP,        /* JMP / JML                                 */
+    INTERP_EDGE_CALL,        /* JSR / JSL executed by the interpreter     */
+    INTERP_EDGE_RETURN,      /* RTS / RTL / RTI                           */
+    INTERP_EDGE_VECTOR,      /* BRK / COP took its vector                 */
+    INTERP_EDGE_EXTERNAL,    /* PC moved by something other than the last
+                                opcode: interrupt delivery, a yield resume,
+                                an unwind landing                          */
+    INTERP_EDGE_AOT_CALL,    /* call bounced to a compiled body           */
+    INTERP_EDGE_ENTRY,       /* compiled code / host entered the bridge   */
+    INTERP_EDGE_KIND_COUNT
+};
+typedef struct InterpEdge {
+    uint32_t from_pc24;   /* last instruction before the transfer (0: ENTRY) */
+    uint32_t to_pc24;
+    int32_t  first_frame;
+    int32_t  last_frame;
+    uint32_t count;       /* times taken while folded into this record */
+    uint16_t sp;          /* guest S on arrival (first time) */
+    uint8_t  kind;        /* INTERP_EDGE_* */
+    uint8_t  op;          /* opcode at from_pc24 */
+} InterpEdge;
+uint64_t interp_bridge_edge_total(void);     /* records ever appended */
+int interp_bridge_edge_capacity(void);
+/* Copy record `seq` (0 = oldest ever appended); 0 if evicted / not yet. */
+int interp_bridge_edge_get(uint64_t seq, InterpEdge *out);
+const char *interp_bridge_edge_kind_name(int kind);
+void interp_bridge_dump_recent_edges(int n, FILE *out);
+
+/* ── Always-on LLE resume-PC ring ───────────────────────────────────────
+ * Every write of the scheduler resume PC and of the pending yield-unwind PC,
+ * old -> new, with the named site that made it. */
+enum {
+    INTERP_RESUME_SITE_IRQ_PENDING,     /* auto-quiescent: IRQ line pending   */
+    INTERP_RESUME_SITE_DEADLINE,        /* auto-quiescent: master deadline    */
+    INTERP_RESUME_SITE_D9_IRQ,          /* $C0:84B2 wait specialization       */
+    INTERP_RESUME_SITE_D9_DEADLINE,
+    INTERP_RESUME_SITE_QUIESCENT,       /* stable CPU/memory state cycle      */
+    INTERP_RESUME_SITE_STABLE_POLL,     /* stable-state poll (interrupt wait) */
+    INTERP_RESUME_SITE_JOYPAD_WAIT,     /* auto-joypad $4212 wait             */
+    INTERP_RESUME_SITE_NESTED_HANDOFF,  /* nested frame on scheduler's wait   */
+    INTERP_RESUME_SITE_YIELD_FLAG,      /* scheduler yield flag matched       */
+    INTERP_RESUME_SITE_WAI,
+    INTERP_RESUME_SITE_DEADLINE_UNWIND, /* scheduler publishes deadline unwind */
+    INTERP_RESUME_SITE_YIELD_UNWIND,    /* bounce owner consumes yield unwind */
+    INTERP_RESUME_SITE_YIELD_PRIMITIVE, /* compiled yield primitive's sentinel */
+    INTERP_RESUME_SITE_STEP_CAP,        /* step-cap bail                      */
+    INTERP_RESUME_SITE_EXTERNAL,        /* interp_bridge_set_lle_resume_pc    */
+    INTERP_RESUME_SITE_ROLLBACK,        /* rollback state load                */
+    INTERP_RESUME_SITE_COUNT
+};
+enum {
+    INTERP_RESUME_KIND_SET,             /* s_lle_resume_pc24 written          */
+    INTERP_RESUME_KIND_UNWIND_ARM,      /* unwind armed for an outer frame    */
+    INTERP_RESUME_KIND_UNWIND_CONSUME,  /* unwind landed: interp resumes there */
+    INTERP_RESUME_KIND_RESTORE,         /* rollback restored the resume PC    */
+};
+typedef struct InterpResumeEvent {
+    uint32_t old_pc24;
+    uint32_t new_pc24;
+    int32_t  frame;
+    uint16_t sp;
+    uint8_t  site;          /* INTERP_RESUME_SITE_* */
+    uint8_t  kind;          /* INTERP_RESUME_KIND_* */
+    int8_t   bridge_depth;  /* interp bridge nesting at the write */
+    int8_t   sched_depth;   /* LLE scheduler nesting at the write */
+    uint16_t pad;
+} InterpResumeEvent;
+uint64_t interp_bridge_resume_total(void);
+int interp_bridge_resume_capacity(void);
+int interp_bridge_resume_get(uint64_t seq, InterpResumeEvent *out);
+const char *interp_bridge_resume_site_name(int site);
+const char *interp_bridge_resume_kind_name(int kind);
+void interp_bridge_dump_resume_ring(int n, FILE *out);
+
+/* Steps, edges and resume writes together: what a halt or trap prints. */
+void interp_bridge_dump_recent(int n, FILE *out);
 #include "cpu_state.h"
 
 /* Launch-time main-scheduler AOT policy: -1 default/environment, 0 floor,
@@ -50,11 +138,15 @@ static inline bool interp_bridge_use_absolute_apu_timeline(
  * pay only the address check. At a match it synchronizes registers into
  * CpuState, invokes the callback, then copies any changes back.
  *
- * Up to 8 PCs may be armed (LoROM FastROM bit7 is masked). Calling with a
+ * Up to 192 registrations may be armed (LoROM FastROM bit7 is masked). Calling with a
  * non-NULL hook adds/replaces that PC; hook=NULL clears all slots. */
 typedef void (*InterpPreOpcodeHook)(CpuState *cpu, uint32_t pc24);
 void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
                                        InterpPreOpcodeHook hook);
+/* Compose without replacing an existing owner's callback. Duplicate pairs are
+ * idempotent. Returns false on invalid input/capacity exhaustion. Callbacks run
+ * in registration order; a redirect completes handling for that original PC. */
+bool interp_bridge_add_pre_opcode_hook(uint32_t pc24, InterpPreOpcodeHook hook);
 void interp_bridge_pre_opcode_redirect(uint32_t pc24);
 
 /*
@@ -87,6 +179,8 @@ int interp_bridge_run_loop(CpuState *cpu, uint32_t entry_pc24,
  * game-address hint. */
 int interp_bridge_run_until_quiescent(CpuState *cpu, uint32_t entry_pc24);
 uint32_t interp_bridge_lle_resume_pc(void);
+/* Host override of the resume PC (recorded in the resume ring as external). */
+void interp_bridge_set_lle_resume_pc(uint32_t pc);
 
 /*
  * Rollback support: the bridge carries execution state across frames that no
@@ -153,6 +247,14 @@ int interp_bridge_resume_task(CpuState *cpu, uint32_t resume_pc24,
 
 /* Count of tier-downs taken this run (observability / tests / Phase-2
  * manifest). */
+/* Optional host coverage hooks; NULL by default. pc_hook fires once per
+ * INTERPRETED opcode (exact). bounce_hook fires once per compiled body
+ * ENTERED -- an entry, not an extent, since a compiled body runs an unknown
+ * number of opcodes without reporting them. Do not treat a bounce as coverage
+ * of the body interior. */
+extern void (*g_interp_bridge_pc_hook)(uint32_t pc24, int m_flag, int x_flag);
+extern void (*g_interp_bridge_bounce_hook)(uint32_t pc24, int m_flag, int x_flag);
+
 long interp_tier_hit_count(void);
 void interp_tier2_stats(int *sites, unsigned long long *clean,
                         unsigned long long *bail);
@@ -174,6 +276,8 @@ void interp_tier2_stats(int *sites, unsigned long long *clean,
  * dump_*_json sections. Tier2CoverageWriteManifest writes the slim standalone
  * manifest (schema "snesrecomp tier2 coverage v1") that the ingest tool reads. */
 void Tier2CoverageDumpJson(FILE *f);
+void Tier2CoverageReset(void);
+void Tier2CoverageTick(int frame);
 void Tier2CoverageWriteManifest(const char *path, const char *rom_title);
 void Tier2CoverageWriteDefaultManifest(const char *rom_title);
 #ifdef SNESRECOMP_TIER2_TEST

@@ -92,6 +92,26 @@ launch flag outranks a built-in default.
 Opposing d-pad directions are filtered on every seat, not just the first two,
 because guest code is entitled to assume a real d-pad.
 
+### 3.1 Local controllers on the desktop host
+
+The desktop host routes local input to every seat a title declares
+(`SnesDesktopHostGame.num_players`, up to 8) that the configured taps reach
+(`RtlPlayerCount()`); it pushes seats 2.. through `RtlSetPadState` before each
+frame, so a multitap title needs no input code of its own.
+
+| Store | Seats 1-2 | Seats 3-8 |
+|---|---|---|
+| keybinds.ini | `[player1]`, `[player2]` | `[player3]`..`[player8]` (unbound until set; written only once named or bound) |
+| config.ini `[Controller]` | `SourceP1`, `SourceP2` | `SourceP3`..`SourceP8` (0 none, 1 keyboard, 2 gamepad) |
+| config.ini `[GamepadMap]` | `EnableGamepad1/2`, `Controls`, `ControlsP2` | `EnableGamepad3`.., `ControlsP3`.. (default Xbox layout) |
+
+Seats 3.. default to no device. `WriteConfigFile` persists their keys only for
+a title that declares them (`ConfigSetPadSeats`), so a two-player title's
+config.ini is unchanged. recomp-ui's SNES profile ceiling is 8 seats; the
+launcher shows `num_players` controller cards. Gamepads are seated in order on
+enabled seats, as for seats 1 and 2. Netplay sessions leave seats 2.. to the
+netplay path.
+
 ## 4. Netplay
 
 recomp-net already carries up to `RNET_MAX_SLOTS` (8) seats, so the wire
@@ -109,9 +129,17 @@ Starting a session with more seats than the port configuration can route is
 five would desync on input and report nothing that names the cause
 (`recomp-ai-rules/NETPLAY.md` §4). Every peer must configure the same taps.
 
-Rollback is unaffected in shape — `snes_netplay_rb` loops over
-`slot_count` — but note that the multitap's shift state is now part of the
-digest; see §6.
+~~Rollback is unaffected in shape — `snes_netplay_rb` loops over
+`slot_count`~~ — **refuted 2026-09-24.** The seat loops did cover
+`slot_count`, but the rollback host filtered every episode message to one peer
+(`rnet_session_set_rb_peer_slot(local == 0 ? 1 : 0)`), arbitrated dual
+initiation as if that were the only other seat, packed epochs with `slot & 1`,
+and took the first BASELINE / POST to arrive as every peer's answer. With
+three or more peers, seats 2+ were never heard. The episode driver now in
+recomp-net tracks BASELINE, POST and COMMIT per peer and reads the initiator's
+seat from the epoch, but more than two peers is **built, not exercised**: no
+multi-peer harness exists. Note too that the multitap's shift state is now
+part of the digest; see §6.
 
 ## 5. What stays byte-identical with no tap
 

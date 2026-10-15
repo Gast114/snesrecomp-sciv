@@ -13,6 +13,7 @@
 #include "sa1.h"
 
 #include "interp816.h"
+#include "tier2_capture.h"
 
 #include <limits.h>
 #include <stdlib.h>
@@ -93,6 +94,10 @@ struct Sa1 {
   uint8_t interrupt_vector_kind; /* 1=NMI, 2=IRQ */
   uint32_t extra_cycles;
   uint32_t cpu_bus_address;
+  Sa1Observer observer;
+  void *observer_context;
+  uint32_t observer_addresses[4];
+  size_t observer_count;
 };
 
 static uint8_t sa1_bus_read(void *opaque, uint32_t address);
@@ -913,6 +918,32 @@ void sa1_set_cpu_bus_address(Sa1 *sa1, uint32_t address) {
   if (sa1) sa1->cpu_bus_address = address & 0xffffffu;
 }
 
+bool sa1_set_observer(Sa1 *sa1, const uint32_t *addresses, size_t count,
+                     Sa1Observer observer, void *context) {
+  if (!sa1 || count > 4 || (observer && (!addresses || !count))) return false;
+  for (size_t i = 0; observer && i < count; ++i)
+    if (addresses[i] > 0xffffff) return false;
+  if (observer) memcpy(sa1->observer_addresses, addresses, count * sizeof(*addresses));
+  sa1->observer_count = observer ? count : 0;
+  sa1->observer_context = observer ? context : NULL;
+  sa1->observer = observer;
+  return true;
+}
+
+static void observe_instruction(Sa1 *sa1) {
+  const Interp816 *cpu = sa1->cpu;
+  if (cpu->stopped || (cpu->waiting && !cpu->nmiWanted && !cpu->irqWanted) ||
+      cpu->nmiWanted || (!cpu->i && cpu->irqWanted)) return;
+  uint32_t pc = ((uint32_t)cpu->k << 16) | cpu->pc;
+  for (size_t i = 0; i < sa1->observer_count; ++i) {
+    if (pc != sa1->observer_addresses[i]) continue;
+    Sa1Observation observation = {pc, sa1->master_clock, sa1->iram, sa1->bwram,
+                                  sizeof(sa1->iram), sa1->bwram_size, cpu->x};
+    sa1->observer(sa1->observer_context, &observation);
+    break;
+  }
+}
+
 void sa1_sync(Sa1 *sa1, uint64_t master_clock) {
   if (!sa1 || master_clock <= sa1->master_clock) return;
   while (sa1->master_clock < master_clock) {
@@ -923,8 +954,14 @@ void sa1_sync(Sa1 *sa1, uint64_t master_clock) {
     }
     sa1_request_interrupt(sa1);
     sa1->extra_cycles = 0;
+    if (sa1->observer) observe_instruction(sa1);
+    uint32_t capture_pc = ((uint32_t)sa1->cpu->k << 16) | sa1->cpu->pc;
+    uint8_t capture_mx = ((uint8_t)sa1->cpu->mf << 1) | (uint8_t)sa1->cpu->xf;
+    uint8_t capture_e = sa1->cpu->e;
     int cycles = interp816_runOpcode(sa1->cpu);
     if (cycles < 1) cycles = 1;
+    if (g_tier2_capture_active)
+      tier2_capture_cpu_instruction(1, capture_pc, capture_mx, capture_e, (unsigned)cycles);
     uint32_t clocks =
         ((uint32_t)cycles + sa1->extra_cycles) *
         SA1_MASTER_CLOCKS_PER_CPU_CYCLE;
