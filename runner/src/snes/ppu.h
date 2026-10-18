@@ -12,6 +12,12 @@
 #include "saveload.h"
 
 typedef struct Ppu Ppu;
+/* Presentation-only tile provenance for optional replacement artwork. px/py
+ * are unflipped texel coordinates; flip describes the subpixel direction. */
+typedef struct PpuTileSource {
+  uint16_t address;
+  uint8_t palette, bpp, px, py, flip, valid;
+} PpuTileSource;
 typedef struct PpuMode7HdSurface {
   uint32_t *pixels;
   size_t pitch; /* Bytes, including optional row padding. */
@@ -175,6 +181,10 @@ typedef struct WindowLayer {
 #define PPU_SAVESTATE_MEM_SIZE 0x10420
 
 struct Ppu {
+  bool hdTracking;
+  PpuTileSource hdObjects[kPpuBufWidth];
+  /* bit 0: colour visible, bit 1: colour math allowed by the colour window. */
+  uint8_t hdColorFlags[kPpuBufWidth];
   /* Optional host body image. Presentation state only; never serialized. */
   const uint32_t *hostObjPixels;
   int hostObjX, hostObjY, hostObjWidth, hostObjHeight, hostObjStride;
@@ -575,6 +585,9 @@ enum {
 Ppu* ppu_init(void);
 void ppu_free(Ppu* ppu);
 void ppu_reset(Ppu* ppu);
+/* Call just after runLine. Conservative fallback for unsupported transforms. */
+bool PpuGetTileSource(Ppu *ppu, int x, unsigned line, uint16_t pixel,
+                      PpuTileSource *source);
 bool ppu_checkOverscan(Ppu* ppu);
 void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);

@@ -1291,7 +1291,9 @@ static void WritePpm(const char *path, const uint8 *pixel_buffer, int pitch,
 static void DrawPpuFrameWithPerf(void) {
   double profile_start = ProfileStart();
   PreparePpuFrame();
-  const int render_scale = 1;
+  int render_scale = g_game->presentation_scale && g_game->draw_hd_frame
+      ? g_game->presentation_scale() : 1;
+  if (render_scale < 1 || render_scale > 10) render_scale = 1;
   uint8 *present_buffer = 0;
   int present_pitch = 0;
 
@@ -1328,7 +1330,10 @@ static void DrawPpuFrameWithPerf(void) {
 #endif
 
   profile_start = ProfileStart();
-  RtlDrawPpuFrame(pixel_buffer, pitch, g_ppu_render_flags);
+  if (render_scale > 1)
+    g_game->draw_hd_frame(pixel_buffer, pitch, g_snes_width, g_snes_height, render_scale);
+  else
+    RtlDrawPpuFrame(pixel_buffer, pitch, g_ppu_render_flags);
 #if defined(SNESRECOMP_HOST_HAS_BLEND)
   /* The shared blend keeps the UNBLENDED frame, so the mix never feeds back
    * on itself, and the PPU's own renderBuffer stays pure for thumbnails.
@@ -1370,14 +1375,17 @@ static void DrawPpuFrameWithPerf(void) {
    * is not executing. That is what locked Super Metroid up when the
    * save-state browser was opened. */
   {
-    const int rows = g_snes_height * render_scale;
-    const int row_bytes = g_snes_width * render_scale * 4;
+    /* Keep modal thumbnails bounded. A title can present its cached HD field
+     * directly under settings; state/rewind panels use this native thumbnail. */
+    const int rows = g_snes_height;
+    const int row_bytes = g_snes_width * 4;
     if (rows > 0 && row_bytes > 0 &&
         (size_t)rows * (size_t)row_bytes <= sizeof(g_frozen_frame)) {
       for (int y = 0; y < rows; y++)
         memcpy(g_frozen_frame + (size_t)y * (size_t)row_bytes,
-               pixel_buffer + (size_t)y * (size_t)pitch, (size_t)row_bytes);
-      g_frozen_w = g_snes_width * render_scale;
+               render_scale > 1 ? g_my_pixels + (size_t)y * row_bytes :
+                   pixel_buffer + (size_t)y * (size_t)pitch, (size_t)row_bytes);
+      g_frozen_w = g_snes_width;
       g_frozen_h = rows;
     }
   }
@@ -1882,8 +1890,11 @@ static void PresentFrozenWithOverlay(void) {
    * middle of the window. */
   const int base_w = g_frozen_w > 0 ? g_frozen_w : g_snes_width;
   const int base_h = g_frozen_h > 0 ? g_frozen_h : g_snes_height;
-  const int draw_w = base_w * 2;
-  const int draw_h = base_h * 2;
+  int hd_scale = !panel && g_game->presentation_scale && g_game->draw_hd_frame
+      ? g_game->presentation_scale() : 1;
+  if (hd_scale < 1 || hd_scale > 10) hd_scale = 1;
+  const int draw_w = base_w * (hd_scale > 1 ? hd_scale : 2);
+  const int draw_h = base_h * (hd_scale > 1 ? hd_scale : 2);
   uint8 *pixel_buffer = 0;
   int pitch = 0;
 
@@ -1893,7 +1904,9 @@ static void PresentFrozenWithOverlay(void) {
     return;
   }
 
-  if (g_frozen_w > 0 && g_frozen_h > 0)
+  if (hd_scale > 1)
+    g_game->draw_hd_frame(pixel_buffer, pitch, base_w, base_h, hd_scale);
+  else if (g_frozen_w > 0 && g_frozen_h > 0)
     snes_ovl_upscale_frame(pixel_buffer, pitch, draw_w, draw_h,
                            (const uint32_t *)g_frozen_frame,
                            g_frozen_w * 4, g_frozen_w, g_frozen_h);

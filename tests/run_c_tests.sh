@@ -65,6 +65,14 @@ echo "=== HD Mode 7 sampling and composition ==="
     -lm -o "$OUT/ppu_mode7_hd_test"
 "$OUT/ppu_mode7_hd_test"
 
+echo "=== HD tile provenance ==="
+"$CC" -std=c11 -O2 -DSNESRECOMP_REVERSE_DEBUG=0 \
+    -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes" \
+    "$ROOT/tests/ppu/ppu_hd_tiles_test.c" \
+    "$ROOT/runner/src/snes/ppu.c" "$ROOT/runner/src/snes/ppu_legacy.c" \
+    -lm -o "$OUT/ppu_hd_tiles_test"
+"$OUT/ppu_hd_tiles_test"
+
 echo "=== PPU raster journal ==="
 "$CC" -std=c11 -Wall -Wextra -O1     -DSNESRECOMP_REVERSE_DEBUG=0     -I "$ROOT/runner/src" -I "$ROOT/runner/src/snes"     "$ROOT/tests/ppu/ppu_raster_journal_test.c"     "$ROOT/runner/src/snes/ppu.c"     "$ROOT/runner/src/snes/ppu_legacy.c"     -lm -o "$OUT/ppu_raster_journal_test"
 "$OUT/ppu_raster_journal_test"

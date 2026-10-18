@@ -833,6 +833,10 @@ void ppu_runLine(Ppu* ppu, int line) {
 
     // evaluate sprites
     ClearBackdrop(ppu, &ppu->objBuffer);
+    if (ppu->hdTracking) {
+      memset(ppu->hdObjects, 0, sizeof(ppu->hdObjects));
+      memset(ppu->hdColorFlags, 0, sizeof(ppu->hdColorFlags));
+    }
     if (ppu->hostObjPixels) {
       memset(ppu->hostObjOwners, 255, sizeof(ppu->hostObjOwners));
       memset(ppu->hostObjColors, 0, sizeof(ppu->hostObjColors));
@@ -1358,6 +1362,72 @@ static uint16 PpuReadTilemapEntry(Ppu *ppu, uint layer, int tx, int ty) {
   if (((tx >> 5) & 1) && PPU_bgTilemapWider(ppu, layer))
     addr += 0x400;
   return PpuRenderVram(ppu)[addr & 0x7fff];
+}
+
+bool PpuGetTileSource(Ppu *ppu, int x, unsigned line, uint16_t pixel,
+                      PpuTileSource *s) {
+  unsigned i = x + kPpuExtraLeftRight, layer = (pixel >> 8) & 15;
+  if (!s || i >= kPpuBufWidth || !ppu->hdTracking ||
+      !(ppu->renderFlags & kPpuRenderFlags_NewRenderer) ||
+      PPU_forcedBlank(ppu) || PPU_mode(ppu) > 1 || PPU_interlace(ppu) ||
+      PPU_pseudoHires(ppu) || PPU_directColor(ppu)) return false;
+  if (layer == 4 || layer == 6) {
+    if (pixel != ppu->objBuffer.data[i] ||
+        (ppu->hostObjPixels && (ppu->hostObjColors[i] >> 24)) ||
+        (ppu->extraObjectCount && (ppu->objectColors[i] & 0x8000))) return false;
+    *s = ppu->hdObjects[i];
+  } else if (layer < 3) {
+    /* Unimplemented transforms remain the native picture. In particular
+     * mosaic must retain its large blocks, not acquire HD detail inside them. */
+    if ((PPU_mosaicEnabled(ppu, layer) && PPU_mosaicSize(ppu) > 1) ||
+        WsShadowLayerActive(layer) || ppu->widescreenLineEnhancer ||
+        PpuWidescreenLayerElasticBandAt(ppu, layer, line) >= 0 ||
+        PpuWidescreenLayerStretchBandActive(ppu, layer, line) ||
+        ppu->wsMarginGapL[layer] || ppu->wsMarginGapR[layer] ||
+        (layer == 2 && line < (ppu->wsHudSplitHeight & 127))) return false;
+    for (unsigned slot = 0; slot < kPpuWsAnchorBands; ++slot)
+      if (line >= ppu->wsAnchorY0[slot][layer] &&
+          line < ppu->wsAnchorY1[slot][layer]) return false;
+    unsigned reflect = 0;
+    int world = PpuWidescreenLayerWorldBandAt(ppu, layer, line);
+    if (world >= 0) {
+      int a = ppu->wsWorldLeft[world][layer] - ppu->hScroll[layer];
+      int b = ppu->wsWorldRight[world][layer] - ppu->hScroll[layer];
+      if (x < a) { x = 2 * a - 1 - x; reflect = 1; }
+      else if (x >= b) { x = 2 * b - 1 - x; reflect = 1; }
+    } else if (x < 0 || x >= 256) {
+      if (PpuWidescreenLayerRepeatBandActive(ppu, layer, line) ||
+          (ppu->wsLayerRepeat & (1u << layer))) x += x < 0 ? 256 : -256;
+      else if (ppu->wsLayerMirror & (1u << layer)) {
+        x = x < 0 ? -x : 510 - x; reflect = 1;
+      }
+    }
+    int sx = x + ppu->hScroll[layer], sy = line + ppu->vScroll[layer];
+    unsigned big = PPU_bigTiles(ppu, layer) ? 1 : 0;
+    uint16_t tile = PpuReadTilemapEntry(ppu, layer, sx >> (3 + big), sy >> (3 + big));
+    unsigned mask = big ? 15 : 7, px = sx & mask, py = sy & mask;
+    if (tile & 0x4000) px = mask - px;
+    if (tile & 0x8000) py = mask - py;
+    unsigned chr = ((tile & 1023) + (px >> 3) + ((py >> 3) << 4)) & 1023;
+    unsigned bpp = PPU_mode(ppu) == 0 || layer == 2 ? 2 : 4;
+    *s = (PpuTileSource){
+        (uint16_t)((PPU_bgTileAdr(ppu, layer) + chr * bpp * 4) & 0x7fff),
+        (uint8_t)(((tile >> 10) & 7) * (1u << bpp) + (PPU_mode(ppu) == 0 ? layer * 32 : 0)),
+        (uint8_t)bpp, (uint8_t)(px & 7), (uint8_t)(py & 7),
+        (uint8_t)((tile >> 14) ^ reflect), 1};
+  } else return false;
+  if (!s->valid) return false;
+  /* Verify provenance against the actual priority winner. Never substitute
+   * an unrelated tile when a host transform or overlay is not understood. */
+  const uint16_t *vram = PpuRenderVram(ppu);
+  unsigned bit = 7 - s->px;
+  uint16_t a = vram[(s->address + s->py) & 0x7fff];
+  unsigned c = ((a >> bit) & 1) | (((a >> (bit + 8)) & 1) << 1);
+  if (s->bpp == 4) {
+    a = vram[(s->address + s->py + 8) & 0x7fff];
+    c |= (((a >> bit) & 1) << 2) | (((a >> (bit + 8)) & 1) << 3);
+  }
+  return c && s->palette + c == (pixel & 255);
 }
 
 /* Capture a native-width Mode 1 4bpp layer independently of the compositor.
@@ -2461,6 +2531,10 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     uint32 clip_color_mask = (cw_clip_math & 1) ? 0x1f : 0;
     uint32 math_enabled_cur = PPU_mathEnabled(ppu) & ((cw_clip_math & 0x100) ? -1 : 0);
     uint32 fixed_color = ppu->fixedColor;
+    if (ppu->hdTracking)
+      memset(ppu->hdColorFlags + left,
+             (clip_color_mask ? 1 : 0) | ((cw_clip_math & 0x100) ? 2 : 0),
+             right - left);
     if (math_enabled_cur == 0 || fixed_color == 0 && !PPU_halfColor(ppu) && !rendered_subscreen) {
       // Math is disabled (or has no effect), so can avoid the per-pixel maths check
       uint32 i = left;
@@ -3008,6 +3082,14 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
               }
         // Lower OAM indices are processed later and overwrite higher ones.
                 dst[0] = z + pixel;
+                if (ppu->hdTracking) {
+                  PpuTileSource *s = &ppu->hdObjects[dst - ppu->objBuffer.data];
+                  *s = (PpuTileSource){
+                      (uint16_t)((objAdr + usedTile * 16) & 0x7fff),
+                      (uint8_t)paletteBase, 4,
+                      (uint8_t)(7 - shift), (uint8_t)(row & 7),
+                      (uint8_t)(oam1 >> 14), 1};
+                }
                 if (ppu->hostObjPixels) ppu->hostObjOwners[dst - ppu->objBuffer.data] = (uint8)slot;
                 if(ppu->extraObjectCount)
                   ppu->objectOrder[dst-ppu->objBuffer.data]=(uint64_t)((slot-first_slot)&127)<<32;

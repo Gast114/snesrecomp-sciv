@@ -213,6 +213,11 @@ typedef struct SnesDesktopHostGame {
   int (*debug_marker_is_open)(void);
   void (*debug_marker_event)(const void *sdl_event);
   void (*debug_marker_pump)(uint32_t pad_pressed);
+  /* Optional high-resolution presentation of a completed native field.
+   * Scale 1..10; does not change guest geometry or snapshot thumbnails.
+   * draw_hd_frame must fill the entire scaled surface, without running CPU. */
+  int (*presentation_scale)(void);
+  void (*draw_hd_frame)(uint8_t *dst, size_t pitch, int width, int height, int scale);
 } SnesDesktopHostGame;
 
 /* The whole program. Returns the process exit code. */
