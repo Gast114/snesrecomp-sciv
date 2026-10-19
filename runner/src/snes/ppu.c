@@ -1364,8 +1364,8 @@ static uint16 PpuReadTilemapEntry(Ppu *ppu, uint layer, int tx, int ty) {
   return PpuRenderVram(ppu)[addr & 0x7fff];
 }
 
-bool PpuGetBackgroundTileSource(Ppu *ppu, int x, unsigned line, unsigned layer,
-                                PpuTileSource *s) {
+static bool PpuBackgroundSource(Ppu *ppu, int x, unsigned line, unsigned layer,
+                                PpuTileSource *s, uint16_t *entry) {
   if (!s || layer >= 3 || !ppu->hdTracking ||
       !(ppu->renderFlags & kPpuRenderFlags_NewRenderer) ||
       PPU_forcedBlank(ppu) || PPU_mode(ppu) > 1 || PPU_interlace(ppu) ||
@@ -1399,6 +1399,7 @@ bool PpuGetBackgroundTileSource(Ppu *ppu, int x, unsigned line, unsigned layer,
     int sx = x + ppu->hScroll[layer], sy = line + ppu->vScroll[layer];
     unsigned big = PPU_bigTiles(ppu, layer) ? 1 : 0;
     uint16_t tile = PpuReadTilemapEntry(ppu, layer, sx >> (3 + big), sy >> (3 + big));
+    if (entry) *entry = tile;
     unsigned mask = big ? 15 : 7, px = sx & mask, py = sy & mask;
     if (tile & 0x4000) px = mask - px;
     if (tile & 0x8000) py = mask - py;
@@ -1413,12 +1414,99 @@ bool PpuGetBackgroundTileSource(Ppu *ppu, int x, unsigned line, unsigned layer,
   return true;
 }
 
+bool PpuGetBackgroundTileSource(Ppu *ppu, int x, unsigned line, unsigned layer,
+                                PpuTileSource *s) {
+  return PpuBackgroundSource(ppu, x, line, layer, s, NULL);
+}
+
+bool PpuGetLayerScanline(Ppu *ppu, unsigned line, unsigned layer,
+                         PpuLayerSample *samples, size_t count) {
+  if (!samples || count < kPpuBufWidth || !ppu->hdTracking ||
+      !(ppu->renderFlags & kPpuRenderFlags_NewRenderer) || ppu->widescreenLineEnhancer ||
+      (PPU_mode(ppu) != 1 && PPU_mode(ppu) != 7) || PPU_forcedBlank(ppu) ||
+      PPU_interlace(ppu) || PPU_pseudoHires(ppu) || PPU_directColor(ppu) ||
+      (PPU_mode(ppu) == 7 && (PPU_m7extBg(ppu) || (PPU_mosaicEnabled(ppu,0) && PPU_mosaicSize(ppu)>1))) ||
+      (layer > 2 && layer != 4)) return false;
+  memset(samples, 0, sizeof(*samples) * kPpuBufWidth);
+  if (PPU_mode(ppu) == 7 && layer != 0 && layer != 4) return true;
+  for (unsigned sub = 0; sub < 2; ++sub) {
+    if (!IS_SCREEN_ENABLED(ppu, sub, layer)) continue;
+    PpuWindows win;
+    if (IS_SCREEN_WINDOWED(ppu, sub, layer)) PpuWindows_Calc(&win, ppu, layer, line);
+    else PpuWindows_Clear(&win, ppu, layer, line);
+    for (unsigned span = 0; span < win.nr; ++span) {
+      if (win.bits & (1u << span)) continue;
+      for (int x = win.edges[span]; x < win.edges[span + 1]; ++x)
+        samples[x + kPpuExtraLeftRight].screens |= 1u << sub;
+    }
+  }
+  const uint16_t *vram = PpuRenderVram(ppu);
+  PpuTileSource run_source = {0};
+  uint16_t run_entry = 0, run_p01 = 0, run_p23 = 0;
+  unsigned remaining = 0;
+  for (int x = -(int)ppu->extraLeftCur; x < 256 + ppu->extraRightCur; ++x) {
+    unsigned i = x + kPpuExtraLeftRight;
+    PpuLayerSample *out = &samples[i];
+    if (layer == 4) {
+      out->pixel = ppu->objBuffer.data[i];
+      out->source = ppu->hdObjects[i];
+      continue;
+    }
+    if (PPU_mode(ppu) == 7) {
+      int cx = SnesMode7HdSign13(ppu->m7matrix[4]), cy = SnesMode7HdSign13(ppu->m7matrix[5]);
+      int h = SnesMode7HdSign13(ppu->m7matrix[6])-cx, v = SnesMode7HdSign13(ppu->m7matrix[7])-cy;
+      h = h & 0x2000 ? h | ~1023 : h & 1023;
+      v = v & 0x2000 ? v | ~1023 : v & 1023;
+      int ry = PPU_m7yFlip(ppu) ? 255-(int)line : (int)line, rx = PPU_m7xFlip(ppu) ? 255-x : x;
+      uint32_t sx = (ppu->m7matrix[0]*h & ~63) + (ppu->m7matrix[1]*ry & ~63) +
+          (ppu->m7matrix[1]*v & ~63) + cx*256 + ppu->m7matrix[0]*rx;
+      uint32_t sy = (ppu->m7matrix[2]*h & ~63) + (ppu->m7matrix[3]*ry & ~63) +
+          (ppu->m7matrix[3]*v & ~63) + cy*256 + ppu->m7matrix[2]*rx;
+      uint32_t limit = PPU_m7largeField(ppu) ? 0x3ffff : 0xffffffff;
+      unsigned tile = 0, c = 0;
+      if ((sx|sy) <= limit || PPU_m7charFill(ppu)) {
+        if ((sx|sy) <= limit) tile = vram[(sy>>11&127)*128+(sx>>11&127)] & 255;
+        c = vram[tile*64+(sy>>8&7)*8+(sx>>8&7)] >> 8;
+      }
+      out->pixel = 0x5000 | c;
+      continue;
+    }
+    if (!remaining) {
+      if (!PpuBackgroundSource(ppu, x, line, layer, &run_source, &run_entry)) {
+        out->screens = 0;
+        continue;
+      }
+      remaining = run_source.flip & 1 ? run_source.px+1 : 8-run_source.px;
+      run_p01 = vram[(run_source.address+run_source.py)&0x7fff];
+      run_p23 = run_source.bpp==4 ? vram[(run_source.address+run_source.py+8)&0x7fff] : 0;
+    }
+    out->source = run_source;
+    uint16_t entry = run_entry;
+    PpuTileSource *s = &out->source;
+    unsigned bit = 7 - s->px;
+    uint16_t bits = run_p01;
+    unsigned c = ((bits >> bit) & 1) | (((bits >> (bit + 8)) & 1) << 1);
+    if (s->bpp == 4) {
+      bits = run_p23;
+      c |= (((bits >> bit) & 1) << 2) | (((bits >> (bit + 8)) & 1) << 3);
+    }
+    static const uint16_t lo[3] = {0x8000, 0x7100, 0x1200};
+    static const uint16_t hi[3] = {0xc000, 0xb100, 0x3200};
+    uint16_t z = entry & 0x2000 ? hi[layer] : lo[layer];
+    if (layer == 2 && (entry & 0x2000) && PPU_bg3priority(ppu)) z = 0xf200;
+    out->pixel = z + s->palette + c;
+    --remaining;
+    if (remaining) run_source.px += run_source.flip & 1 ? -1 : 1;
+  }
+  return true;
+}
+
 bool PpuGetTileSource(Ppu *ppu, int x, unsigned line, uint16_t pixel,
                       PpuTileSource *s) {
   unsigned i = x + kPpuExtraLeftRight, layer = (pixel >> 8) & 15;
   if (!s || i >= kPpuBufWidth || !ppu->hdTracking ||
       !(ppu->renderFlags & kPpuRenderFlags_NewRenderer) ||
-      PPU_forcedBlank(ppu) || PPU_mode(ppu) > 1 || PPU_interlace(ppu) ||
+      PPU_forcedBlank(ppu) || (PPU_mode(ppu) > 1 && (PPU_mode(ppu) != 7 || (layer != 4 && layer != 6))) || PPU_interlace(ppu) ||
       PPU_pseudoHires(ppu) || PPU_directColor(ppu)) return false;
   if (layer == 4 || layer == 6) {
     if (pixel != ppu->objBuffer.data[i] ||

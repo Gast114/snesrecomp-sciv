@@ -18,6 +18,14 @@ typedef struct PpuTileSource {
   uint16_t address;
   uint8_t palette, bpp, px, py, flip, valid;
 } PpuTileSource;
+/* Read-only Mode 1/7 presentation candidates, including transparent BG texels.
+ * screens: bit0 main, bit1 sub, after native screen/window/viewport policy.
+ * pixel retains priority and palette even when the colour index is zero. */
+typedef struct PpuLayerSample {
+  PpuTileSource source;
+  uint16_t pixel;
+  uint8_t screens;
+} PpuLayerSample;
 typedef struct PpuMode7HdSurface {
   uint32_t *pixels;
   size_t pitch; /* Bytes, including optional row padding. */
@@ -592,6 +600,8 @@ bool PpuGetTileSource(Ppu *ppu, int x, unsigned line, uint16_t pixel,
  * or transparent. Does not assert visibility; use PpuGetTileSource for that. */
 bool PpuGetBackgroundTileSource(Ppu *ppu, int x, unsigned line, unsigned layer,
                                 PpuTileSource *source);
+bool PpuGetLayerScanline(Ppu *ppu, unsigned line, unsigned layer,
+                         PpuLayerSample *samples, size_t count);
 bool ppu_checkOverscan(Ppu* ppu);
 void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);

@@ -33,6 +33,30 @@ static PpuTileSource sample(int x) {
   return s;
 }
 int main(void) {
+  /* Layer candidates expose transparent texels and the actual windows without
+   * changing the native PPU. This permits HD alpha before the priority test. */
+  static PpuLayerSample candidates[kPpuBufWidth];
+  setup(); p.screenEnabled[1]=1; p.vram[0x1000]=1;
+  p.windowsel=2; p.window1left=8;p.window1right=15;p.screenWindowed[0]=1;
+  ppu_runLine(&p,1);
+  Ppu *before=malloc(sizeof(p));memcpy(before,&p,sizeof(p));
+  assert(PpuGetLayerScanline(&p,1,0,candidates,kPpuBufWidth));
+  assert(!memcmp(before,&p,sizeof(p)));free(before);
+  assert(candidates[kPpuExtraLeftRight+3].screens==3);
+  assert(candidates[kPpuExtraLeftRight+10].screens==2);
+  assert(candidates[kPpuExtraLeftRight+3].pixel==0x8001);
+  assert(candidates[kPpuExtraLeftRight+10].source.valid);
+  assert(!(candidates[kPpuExtraLeftRight+10].pixel&15));
+  assert(!PpuGetLayerScanline(&p,1,3,candidates,kPpuBufWidth));
+  assert(!PpuGetLayerScanline(&p,1,0,candidates,kPpuBufWidth-1));
+  setup();p.bgmode=7;p.m7matrix[0]=256;p.m7matrix[3]=256;p.vram[0]=1;
+  for(int i=0;i<64;++i)p.vram[64+i]=0x0300;
+  ppu_runLine(&p,1);
+  assert(PpuGetLayerScanline(&p,1,0,candidates,kPpuBufWidth));
+  assert(candidates[kPpuExtraLeftRight+3].pixel==0x5003);
+  assert((p.bgBuffers[0].data[kPpuExtraLeftRight+3]&255)==3);
+  assert(PpuGetLayerScanline(&p,1,1,candidates,kPpuBufWidth));
+  assert(!candidates[kPpuExtraLeftRight+3].screens);
   /* Background identity survives transparent texels and another layer covering
    * it. It is only a context query, never a visibility assertion. */
   setup(); p.vram[0x1000]=7; p.vram[7*16+1]=0;
