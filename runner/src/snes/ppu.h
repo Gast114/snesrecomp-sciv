@@ -588,6 +588,10 @@ void ppu_reset(Ppu* ppu);
 /* Call just after runLine. Conservative fallback for unsupported transforms. */
 bool PpuGetTileSource(Ppu *ppu, int x, unsigned line, uint16_t pixel,
                       PpuTileSource *source);
+/* Neighbourhood identity under current scanline registers, even if occluded
+ * or transparent. Does not assert visibility; use PpuGetTileSource for that. */
+bool PpuGetBackgroundTileSource(Ppu *ppu, int x, unsigned line, unsigned layer,
+                                PpuTileSource *source);
 bool ppu_checkOverscan(Ppu* ppu);
 void ppu_handleVblank(Ppu* ppu);
 void ppu_runLine(Ppu* ppu, int line);

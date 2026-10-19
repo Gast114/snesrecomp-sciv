@@ -33,6 +33,16 @@ static PpuTileSource sample(int x) {
   return s;
 }
 int main(void) {
+  /* Background identity survives transparent texels and another layer covering
+   * it. It is only a context query, never a visibility assertion. */
+  setup(); p.vram[0x1000]=7; p.vram[7*16+1]=0;
+  ppu_runLine(&p,1); PpuTileSource hidden={0};
+  assert(PpuGetBackgroundTileSource(&p,3,1,0,&hidden));
+  assert(hidden.address==7*16 && hidden.px==3 && hidden.py==1);
+  assert(!PpuGetTileSource(&p,3,1,p.bgBuffers[0].data[275],&hidden));
+  assert(!PpuGetBackgroundTileSource(&p,3,1,3,&hidden));
+  p.bgmode=7;
+  assert(!PpuGetBackgroundTileSource(&p,3,1,0,&hidden));
   for (unsigned flip=0;flip<4;flip++) {
     setup(); p.vram[0x1000]=1|(2<<10)|(flip<<14); ppu_runLine(&p,1);
     PpuTileSource s=sample(3);

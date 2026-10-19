@@ -1364,19 +1364,13 @@ static uint16 PpuReadTilemapEntry(Ppu *ppu, uint layer, int tx, int ty) {
   return PpuRenderVram(ppu)[addr & 0x7fff];
 }
 
-bool PpuGetTileSource(Ppu *ppu, int x, unsigned line, uint16_t pixel,
-                      PpuTileSource *s) {
-  unsigned i = x + kPpuExtraLeftRight, layer = (pixel >> 8) & 15;
-  if (!s || i >= kPpuBufWidth || !ppu->hdTracking ||
+bool PpuGetBackgroundTileSource(Ppu *ppu, int x, unsigned line, unsigned layer,
+                                PpuTileSource *s) {
+  if (!s || layer >= 3 || !ppu->hdTracking ||
       !(ppu->renderFlags & kPpuRenderFlags_NewRenderer) ||
       PPU_forcedBlank(ppu) || PPU_mode(ppu) > 1 || PPU_interlace(ppu) ||
       PPU_pseudoHires(ppu) || PPU_directColor(ppu)) return false;
-  if (layer == 4 || layer == 6) {
-    if (pixel != ppu->objBuffer.data[i] ||
-        (ppu->hostObjPixels && (ppu->hostObjColors[i] >> 24)) ||
-        (ppu->extraObjectCount && (ppu->objectColors[i] & 0x8000))) return false;
-    *s = ppu->hdObjects[i];
-  } else if (layer < 3) {
+  {
     /* Unimplemented transforms remain the native picture. In particular
      * mosaic must retain its large blocks, not acquire HD detail inside them. */
     if ((PPU_mosaicEnabled(ppu, layer) && PPU_mosaicSize(ppu) > 1) ||
@@ -1415,7 +1409,23 @@ bool PpuGetTileSource(Ppu *ppu, int x, unsigned line, uint16_t pixel,
         (uint8_t)(((tile >> 10) & 7) * (1u << bpp) + (PPU_mode(ppu) == 0 ? layer * 32 : 0)),
         (uint8_t)bpp, (uint8_t)(px & 7), (uint8_t)(py & 7),
         (uint8_t)((tile >> 14) ^ reflect), 1};
-  } else return false;
+  }
+  return true;
+}
+
+bool PpuGetTileSource(Ppu *ppu, int x, unsigned line, uint16_t pixel,
+                      PpuTileSource *s) {
+  unsigned i = x + kPpuExtraLeftRight, layer = (pixel >> 8) & 15;
+  if (!s || i >= kPpuBufWidth || !ppu->hdTracking ||
+      !(ppu->renderFlags & kPpuRenderFlags_NewRenderer) ||
+      PPU_forcedBlank(ppu) || PPU_mode(ppu) > 1 || PPU_interlace(ppu) ||
+      PPU_pseudoHires(ppu) || PPU_directColor(ppu)) return false;
+  if (layer == 4 || layer == 6) {
+    if (pixel != ppu->objBuffer.data[i] ||
+        (ppu->hostObjPixels && (ppu->hostObjColors[i] >> 24)) ||
+        (ppu->extraObjectCount && (ppu->objectColors[i] & 0x8000))) return false;
+    *s = ppu->hdObjects[i];
+  } else if (!PpuGetBackgroundTileSource(ppu, x, line, layer, s)) return false;
   if (!s->valid) return false;
   /* Verify provenance against the actual priority winner. Never substitute
    * an unrelated tile when a host transform or overlay is not understood. */
