@@ -23,9 +23,12 @@ void snes_host_clock_simulation_done(SnesHostClock *c, double now,
   double deadline = c->next_simulation + elapsed_periods / c->simulation_hz;
   /* Keep ordinary sub-frame scheduling jitter on the original phase. A
    * loader may preserve its backlog so its non-interactive frames refill the
-   * guest-driven audio queue; all ordinary gameplay drops stale work. */
+   * guest-driven audio queue; all ordinary gameplay drops stale work.
+   * An over-budget frame has already spent its period: do not add a second
+   * full wait after finishing it. Re-anchor just beyond now, so a caller
+   * draining a fixed timestamp admits only one frame, without catch-up debt. */
   c->next_simulation = preserve_debt || now <= deadline
-      ? deadline : now + 1.0 / c->simulation_hz;
+      ? deadline : nextafter(now, INFINITY);
   ++c->simulation_frames;
 }
 

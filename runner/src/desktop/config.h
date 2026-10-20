@@ -108,8 +108,8 @@ typedef struct Config {
   bool display_perf_title;
 
   // Skip the per-frame SDL_Delay pacing. Off by default (pacing on) so audio
-  // stays in sync; cfg-only escape hatch (DisableFrameDelay = 1) for users on
-  // an exactly-60 Hz / vsync-correct display who want the perf.
+  // stays in sync. DisableFrameDelay = 1 is an explicitly unthrottled test
+  // mode; it also disables VSync and is never a normal-speed setting.
   bool disable_frame_delay;
 
   // Boot straight to the game, skipping the GUI launcher, on subsequent runs.

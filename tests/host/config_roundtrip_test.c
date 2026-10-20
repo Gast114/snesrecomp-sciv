@@ -320,6 +320,19 @@ static void test_multitap_seats_roundtrip(void) {
   ConfigSetPadSeats(2);
 }
 
+static void test_original_speed_roundtrip(void) {
+  write_file(kBaseIni);
+  ParseConfigFile(kPath);
+  CHECK(!g_config.disable_frame_delay, "normal play must default to paced execution");
+  for (int fast = 1; fast >= 0; --fast) {
+    g_config.disable_frame_delay = fast;
+    WriteConfigFile(kPath);
+    g_config.disable_frame_delay = !fast;
+    ParseConfigFile(kPath);
+    CHECK(g_config.disable_frame_delay == fast, "frame pacing setting lost on restart");
+  }
+}
+
 static void test_optional_shortcuts(void) {
   char binding[256];int index,count;
   write_file("[Graphics]\nWindowScale=2\n[KeyMap]\nDebugMarker=Ctrl+D\n");
@@ -349,6 +362,7 @@ int main(void) {
   test_written_from_nothing();
   test_video_settings_roundtrip();
   test_multitap_seats_roundtrip();
+  test_original_speed_roundtrip();
   /* Last: it flips the process-wide opt-in and never flips it back. */
   test_rewind_opt_in();
   test_optional_shortcuts();

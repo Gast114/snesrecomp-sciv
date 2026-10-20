@@ -934,6 +934,7 @@ void WriteConfigFile(const char *filename) {
     { "Graphics",   "VSync" },
     { "Graphics",   "Renderer" },
     { "General",    "RunAhead" },
+    { "General",    "DisableFrameDelay" },
     { "Sound",      "Volume" },
     { "Controller", "SourceP1" },
     { "Controller", "SourceP2" },
@@ -979,6 +980,7 @@ void WriteConfigFile(const char *filename) {
   CfgSet(kvs, N, "Graphics", "Renderer", "%s",
          g_config.renderer[0] ? g_config.renderer : "auto");
   CfgSet(kvs, N, "General", "RunAhead", "%d", g_config.run_ahead);
+  CfgSet(kvs, N, "General", "DisableFrameDelay", "%d", g_config.disable_frame_delay);
   CfgSet(kvs, N, "Sound", "Volume", "%d", g_config.volume);
   CfgSet(kvs, N, "Controller", "SourceP1", "%d", g_config.player_src[0]);
   CfgSet(kvs, N, "Controller", "SourceP2", "%d", g_config.player_src[1]);

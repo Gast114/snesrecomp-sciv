@@ -2016,6 +2016,10 @@ static int RuntimeSettingsGet(void *context, const RecompRuntimeUiItem *item,
     *value_out = g_config.run_ahead;
     return 1;
   }
+  if (!strcmp(item->key, "emulation.original_speed")) {
+    *value_out = !g_config.disable_frame_delay;
+    return 1;
+  }
   return 0;
 }
 
@@ -2068,6 +2072,11 @@ static int RuntimeSettingsSet(void *context, const RecompRuntimeUiItem *item,
     g_config.run_ahead = IntMin(IntMax(value, 0), 2);
     snes_runahead_set_frames(g_config.run_ahead);
     snes_runahead_configure();
+    return 1;
+  }
+  if (!strcmp(item->key, "emulation.original_speed")) {
+    g_config.disable_frame_delay = value == 0;
+    g_reset_clock = true;
     return 1;
   }
   return 0;
@@ -2175,6 +2184,9 @@ static void RuntimeSettingsInit(void) {
   if (!g_game->escape_settings || g_runtime_settings) return;
   RecompRuntimeUiStandardConfig config;
   static const RecompRuntimeUiItem extras[] = {
+    { "emulation.original_speed", "Emulation", "Original game speed (NTSC)",
+      "Keep simulation at its original 60.0988 Hz, independent of HD graphics. Disable only for unthrottled tests.",
+      RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
     { "graphics.no_sprite_limits", "Graphics", "Remove sprite limits",
       "Avoid SNES scanline sprite dropouts in the wider view.",
       RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, NULL, 0, NULL },
@@ -5283,8 +5295,7 @@ static const char kDefaultConfigIniContent[] =
   "# Automatically save state on quit and reload on start\n"
   "Autosave = 0\n"
   "\n"
-  "# Disable the SDL_Delay that happens each frame (slightly better\n"
-  "# perf if your display is set to exactly 60hz)\n"
+  "# Keep 0 for original game speed. 1 is unthrottled test/benchmark mode.\n"
   "DisableFrameDelay = 0\n"
   "\n"
   "[Graphics]\n"

@@ -44,6 +44,20 @@ int main(void) {
     snes_host_clock_simulation_done(&stalled, 5, false, 1);
   assert(stalled.simulation_frames == 1);
 
+  /* A 20ms render cannot achieve 60Hz, but must not be slowed to ~27Hz by
+   * sleeping a whole extra period after every over-budget frame. */
+  SnesHostClock heavy;
+  snes_host_clock_reset(&heavy, 0, sim, sim);
+  double dispatched = 0;
+  for (int frame = 0; frame < 100; ++frame) {
+    double finished = dispatched + .020;
+    snes_host_clock_simulation_done(&heavy, finished, false, 1);
+    assert(heavy.next_simulation > finished);
+    assert(heavy.next_simulation - finished < 1e-9);
+    dispatched = heavy.next_simulation;
+  }
+  assert(fabs(dispatched - 2.0) < 1e-9);
+
   /* A title may ask to PRESERVE the debt (a loading phase that refills a
    * guest-driven audio queue) -- then the backlog is repaid in full. */
   SnesHostClock loading;
