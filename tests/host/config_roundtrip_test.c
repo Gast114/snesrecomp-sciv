@@ -320,6 +320,28 @@ static void test_multitap_seats_roundtrip(void) {
   ConfigSetPadSeats(2);
 }
 
+static void test_optional_shortcuts(void) {
+  char binding[256];int index,count;
+  write_file("[Graphics]\nWindowScale=2\n[KeyMap]\nDebugMarker=Ctrl+D\n");
+  ParseConfigFile(kPath);
+  CHECK(FindCmdForSdlKey(SDLK_h,KMOD_CTRL)==0,"HD shortcut leaked to non-opt-in host");
+  ConfigUseHdToggleDefaults();ConfigUseRuntimeMenuDefaults();ConfigReloadKeyMap(kPath);
+  CHECK(FindCmdForSdlKey(SDLK_h,KMOD_CTRL)==kKeys_ToggleHD,"HD default absent");
+  CHECK(FindCmdForSdlKey(SDLK_ESCAPE,0)==kKeys_OpenSettings,"menu default absent");
+  CHECK(!strcmp(ConfigCommandGroup(kKeys_Load+19,&index,&count),"Load")&&index==19&&count==20,"slot group metadata wrong");
+  ConfigGetCommandBinding(kKeys_DebugMarker,binding,sizeof(binding));
+  CHECK(!strcmp(binding,"Ctrl+D"),"modifier display wrong: %s",binding);
+  write_file("[KeyMap]\nToggleHD=Alt+H\nOpenSettings=None\nLoad=F2,None,F3\n");
+  ConfigReloadKeyMap(kPath);
+  CHECK(FindCmdForSdlKey(SDLK_h,KMOD_ALT)==kKeys_ToggleHD&&FindCmdForSdlKey(SDLK_h,KMOD_CTRL)==0,"HD rebind not live");
+  CHECK(FindCmdForSdlKey(SDLK_ESCAPE,0)==0,"cleared menu default restored");
+  CHECK(g_config.window_scale==2,"keyboard reload changed scalar settings");
+  ConfigGetCommandBinding(kKeys_Load+1,binding,sizeof(binding));
+  CHECK(!strcmp(binding,"None"),"empty slot not represented");
+  ConfigGetCommandBinding(kKeys_Load+2,binding,sizeof(binding));
+  CHECK(!strcmp(binding,"F3"),"sibling slot moved: %s",binding);
+}
+
 int main(void) {
   test_fullscreen_roundtrip();
   test_player_sources_roundtrip();
@@ -329,6 +351,7 @@ int main(void) {
   test_multitap_seats_roundtrip();
   /* Last: it flips the process-wide opt-in and never flips it back. */
   test_rewind_opt_in();
+  test_optional_shortcuts();
   remove(kPath);
   if (g_failures) {
     fprintf(stderr, "config round-trip: %d failure(s)\n", g_failures);

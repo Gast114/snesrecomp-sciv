@@ -413,6 +413,8 @@ static int WindowBaseHeight(void) {
 
 static int g_last_drawable_width, g_last_drawable_height;
 static const char *g_active_config_file;
+static bool g_overlay_modal;
+const char *SnesDesktopConfigPath(void) { return g_active_config_file ? g_active_config_file : "config.ini"; }
 static int g_sdl_audio_mixer_volume = SNESRECOMP_SDL_MIX_MAXVOLUME;
 
 static struct RendererFuncs g_renderer_funcs;
@@ -1114,9 +1116,10 @@ void ChangeWindowScale(int scale_step) {
   }
 }
 
-#define RESIZE_BORDER 20
+#define RESIZE_BORDER 6
 static SDL_HitTestResult HitTestCallback(SDL_Window *win, const SDL_Point *pt, void *data) {
   (void)data;
+  if (g_overlay_modal) return SDL_HITTEST_NORMAL;
   uint32 flags = SDL_GetWindowFlags(win);
   if ((flags & SNESRECOMP_SDL_WINDOW_FULLSCREEN_DESKTOP) != 0 || (flags & SDL_WINDOW_FULLSCREEN) != 0)
     return SDL_HITTEST_NORMAL;
@@ -1595,7 +1598,6 @@ static bool HandleDeviceEvent(const SDL_Event *event) {
  * is asking which state to load, and a load behind it is the same class of
  * bug as F1 through HandleInput. Controller bits still flow, so the panel
  * can be navigated. */
-static bool g_overlay_modal;
 static void SetAudioPaused(bool paused);
 static void ResetAudioTimeline(void);
 #if defined(RECOMP_LAUNCHER)
@@ -1630,7 +1632,7 @@ static void PumpOverlayEvents(bool *running, void (*key_down)(int key, int repea
   while (SDL_PollEvent(&event)) {
 #if defined(SNESRECOMP_IMGUI_ESCAPE_SETTINGS)
     if (key_down == RuntimeSettingsKeyDown)
-      Cv4RuntimeSettingsImGuiProcessEvent(&event);
+      if(Cv4RuntimeSettingsImGuiProcessEvent(&event)) continue;
 #endif
     if (HandleDeviceEvent(&event))
       continue;
@@ -1739,6 +1741,15 @@ static void PadGestureConfigure(PadGesture *g, const char *configured,
     PadGestureParse(def, &g->pad, &g->raw, tag, key);
   }
   g->ok = true;
+}
+
+void SnesDesktopSetGesture(bool debug, const char *spec) {
+  char *saved = debug ? g_config.debug_gesture : g_config.rewind_gesture;
+  snprintf(saved, sizeof(g_config.debug_gesture), "%s", spec);
+  PadGestureConfigure(debug ? &g_debug_marker_gesture : &g_rewind_gesture,
+                      saved, debug ? "Select+L3" : "Select+R3",
+                      debug ? "debug marker" : "rewind",
+                      debug ? "DebugGesture" : "RewindGesture");
 }
 
 /* Edge-triggered: true on the frame the whole gesture becomes held. */
@@ -2113,8 +2124,18 @@ static void RunRuntimeSettingsLoop(bool *running) {
   uint32 prev_pad = 0;
   unsigned frames = 0;
   const bool selftest = HostGetenv("SETTINGS_SELFTEST") != NULL;
+  int old_width, old_height;
+  int old_scale = g_current_window_scale;
+  SDL_GetWindowSize(g_window, &old_width, &old_height);
+  bool expand = !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN) &&
+                (old_width < 800 || old_height < 600);
+  if (expand) SDL_SetWindowSize(g_window, IntMax(old_width, 800), IntMax(old_height, 600));
   host_report_breadcrumb("settings overlay OPEN - guest and audio paused");
   g_overlay_modal = true;
+  if (selftest) {
+    SDL_Point p = {100, 10};
+    fprintf(stderr,"settings menu hit-test normal=%d\n",HitTestCallback(g_window,&p,NULL)==SDL_HITTEST_NORMAL);
+  }
   SetAudioPaused(true);
   while (recomp_runtime_ui_is_open(g_runtime_settings) && *running) {
     PumpOverlayEvents(running, &RuntimeSettingsKeyDown);
@@ -2135,11 +2156,15 @@ static void RunRuntimeSettingsLoop(bool *running) {
     prev_pad = pad;
     PresentFrozenWithOverlay();
     if (selftest && frames == 2) RequestScreenshot();
-    if (selftest && frames == 20) recomp_runtime_ui_close(g_runtime_settings);
+    if (selftest && frames == (HostGetenv("SHORTCUT_UI_SELFTEST") ? 40 : 20))
+      recomp_runtime_ui_close(g_runtime_settings);
     SDL_Delay(8);
     frames++;
   }
   g_overlay_modal = false;
+  if (expand && old_scale == g_current_window_scale &&
+      !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN))
+    SDL_SetWindowSize(g_window, old_width, old_height);
   ResetAudioTimeline();
   SetAudioPaused(g_paused);
   OverlayNoteClosed();
@@ -3461,6 +3486,8 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
   if (game->state_menu_hotkeys) ConfigUseStateMenuDefaults();
   if (game->in_game_launcher) ConfigUseInGameLauncherDefaults();
   if (game->debug_marker_open) ConfigUseDebugMarkerDefaults();
+  if (game->toggle_hd) ConfigUseHdToggleDefaults();
+  if (game->escape_settings) ConfigUseRuntimeMenuDefaults();
   /* Before parsing: default [GamepadMap] rows exist for each routed seat. */
   ConfigSetPadSeats(HostConfiguredSeats());
   ParseConfigFile(config_file);
@@ -4179,9 +4206,12 @@ error_reading:;
         }
         break;
       case SDL_KEYDOWN:
+        if (SNESRECOMP_SDL_EVENT_REPEAT(event) &&
+            FindCmdForSdlKey(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event)) == kKeys_ToggleHD)
+          break;
 #if defined(RECOMP_LAUNCHER)
         if (game->escape_settings &&
-            SNESRECOMP_SDL_EVENT_KEY(event) == SDLK_ESCAPE &&
+            FindCmdForSdlKey(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event)) == kKeys_OpenSettings &&
             g_runtime_settings) {
           recomp_runtime_ui_open(g_runtime_settings);
           break;
@@ -4234,6 +4264,32 @@ error_reading:;
     }
 #endif
     OverlaySelftestPadMainTick(frameCtr);
+    /* Opt-in regression: real SDL dispatch, including an OS repeat. */
+    {
+      static bool key_test_done;
+      const char *key_test = HostGetenv("HD_KEY_SELFTEST");
+      if (key_test && !key_test_done && frameCtr >= 1297 && game->toggle_hd) {
+        key_test_done = true;
+        SDL_Event e = {0};
+        e.type = SDL_KEYDOWN;
+#if SNESRECOMP_SDL3
+        e.key.key = SDLK_h;
+        e.key.mod = !strcmp(key_test, "Alt") ? KMOD_ALT : KMOD_CTRL;
+#else
+        e.key.keysym.sym = SDLK_h;
+        e.key.keysym.mod = !strcmp(key_test, "Alt") ? KMOD_ALT : KMOD_CTRL;
+#endif
+        SDL_PushEvent(&e);
+#if SNESRECOMP_SDL3
+        e.key.repeat = true;
+#else
+        e.key.repeat = 1;
+#endif
+        SDL_PushEvent(&e);
+        e.type = SDL_KEYUP;
+        SDL_PushEvent(&e);
+      }
+    }
     /* SNESRECOMP_VOLUME_DEMO=<frame>: press VolumeDown once at that frame, so
      * a headless screenshot can show the bar. */
     {
@@ -4933,6 +4989,14 @@ static void HandleCommand(uint32 j, bool pressed) {
       break;
     case kKeys_DebugMarker:
       if (g_game->debug_marker_open) g_debug_marker_hotkey = 1;
+      break;
+    case kKeys_ToggleHD:
+      if(g_game->toggle_hd)g_game->toggle_hd();
+      break;
+    case kKeys_OpenSettings:
+#if defined(RECOMP_LAUNCHER)
+      if(g_runtime_settings)recomp_runtime_ui_open(g_runtime_settings);
+#endif
       break;
     case kKeys_ToggleRenderer:
       g_ppu_render_flags ^= kPpuRenderFlags_NewRenderer;

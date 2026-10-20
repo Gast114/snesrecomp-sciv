@@ -95,6 +95,8 @@ void ConfigUseInGameLauncherDefaults(void) {
 void ConfigUseDebugMarkerDefaults(void) {
   kDefaultKbdControls[kKeys_DebugMarker] = C(SDLK_d);
 }
+void ConfigUseHdToggleDefaults(void) { kDefaultKbdControls[kKeys_ToggleHD] = C(SDLK_h); }
+void ConfigUseRuntimeMenuDefaults(void) { kDefaultKbdControls[kKeys_OpenSettings] = _(SDLK_ESCAPE); }
 #undef _
 #undef A
 #undef C
@@ -116,6 +118,7 @@ static const KeyNameId kKeyNameId[] = {
   S(Fullscreen), S(Reset),
   S(Pause), S(PauseDimmed), S(Turbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleWidescreen),
   S(SaveStateMenu), S(Rewind), S(Screenshot), S(OpenLauncher), S(DebugMarker),
+  S(ToggleHD), S(OpenSettings),
 };
 #undef S
 #undef M
@@ -127,6 +130,31 @@ static uint16 keymap_hash_first[255];
 static KeyMapHashEnt *keymap_hash;
 static int keymap_hash_size;
 static bool has_keynameid[countof(kKeyNameId)];
+
+const char *ConfigCommandGroup(int command, int *index, int *count) {
+  for (unsigned i=1;i<countof(kKeyNameId);++i) {
+    const KeyNameId *group=&kKeyNameId[i];
+    if (command>=group->id && command<group->id+group->size) {
+      if(index)*index=command-group->id;
+      if(count)*count=group->size;
+      return group->name;
+    }
+  }
+  return NULL;
+}
+void ConfigGetCommandBinding(int command, char *out, size_t capacity) {
+  if(!capacity)return;
+  out[0]=0;
+  for(int i=0;i<keymap_hash_size;++i) if(keymap_hash[i].cmd==command) {
+    unsigned key=keymap_hash[i].key;
+    SDL_Keycode code=key & 0x1ff;
+    if(key&kKeyMod_ScanCode)code|=SDLK_SCANCODE_MASK;
+    size_t n=strlen(out);
+    snprintf(out+n,capacity-n,"%s%s%s%s%s",n?",":"",key&kKeyMod_Ctrl?"Ctrl+":"",
+        key&kKeyMod_Alt?"Alt+":"",key&kKeyMod_Shift?"Shift+":"",SDL_GetKeyName(code));
+  }
+  if(!out[0])snprintf(out,capacity,"None");
+}
 
 static bool KeyMapHash_Add(uint16 key, uint16 cmd) {
   if (!key)

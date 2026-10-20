@@ -66,6 +66,8 @@ enum {
   /* Freeze the guest and record a debug marker
    * (SnesDesktopHostGame.debug_marker_open). Appended like the others. */
   kKeys_DebugMarker,
+  kKeys_ToggleHD,
+  kKeys_OpenSettings,
   kKeys_Total,
 };
 
@@ -224,6 +226,11 @@ void ConfigUseStateMenuDefaults(void);
 void ConfigUseInGameLauncherDefaults(void);
 /* Ctrl+D for [KeyMap] DebugMarker, for a host that offers debug markers. */
 void ConfigUseDebugMarkerDefaults(void);
+void ConfigUseHdToggleDefaults(void);
+void ConfigUseRuntimeMenuDefaults(void);
+/* Read live bindings, including defaults. Group index is used for Load/Save. */
+const char *ConfigCommandGroup(int command, int *index, int *count);
+void ConfigGetCommandBinding(int command, char *out, size_t capacity);
 void ParseConfigFile(const char *filename);
 // Re-apply only the [KeyMap] section (launcher hotkey editor wrote it after
 // the initial parse). Keyboard command map is rebuilt; gamepad map and all

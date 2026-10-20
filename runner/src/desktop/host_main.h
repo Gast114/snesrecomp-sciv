@@ -218,7 +218,10 @@ typedef struct SnesDesktopHostGame {
    * draw_hd_frame must fill the entire scaled surface, without running CPU. */
   int (*presentation_scale)(void);
   void (*draw_hd_frame)(uint8_t *dst, size_t pitch, int width, int height, int scale);
+  void (*toggle_hd)(void);
 } SnesDesktopHostGame;
+const char *SnesDesktopConfigPath(void);
+void SnesDesktopSetGesture(bool debug, const char *spec);
 
 /* The whole program. Returns the process exit code. */
 int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **argv);
