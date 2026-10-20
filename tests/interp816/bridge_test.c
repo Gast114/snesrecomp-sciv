@@ -69,6 +69,7 @@ bool sa1_cpu_irq_pending(const Sa1 *sa1) { (void)sa1; return false; }
 int g_recomp_stack_top;
 uint16_t g_cpu_entry_s[64];
 uint8 g_memsel;
+uint8_t g_cpu_bus_policy;
 void debug_on_block_enter(uint32_t pc, uint32_t a, uint32_t x, uint32_t y) {
     (void)pc; (void)a; (void)x; (void)y;
 }

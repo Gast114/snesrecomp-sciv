@@ -351,9 +351,14 @@ static inline void cpu_pace_cycles_word(uint16 addr) {
  * (interp_bridge.c bridge_region_speed) and the AOT paced accessors below
  * share this single C implementation so both tiers price transfers
  * identically. */
+uint8_t g_cpu_bus_policy;
 uint32_t cpu_region_speed(uint32_t adr) {
     uint8_t bank = (uint8_t)(adr >> 16);
     uint16_t a = (uint16_t)adr;
+    if (g_cpu_bus_policy == 2 && (bank==0x7e || bank==0x7f ||
+        (a<0x2000 && (bank<0x40 || (bank>=0x80 && bank<0xc0))))) return 4;
+    if (g_cpu_bus_policy && a >= 0x8000 && (bank < 0x40 || bank >= 0x80))
+        return g_cpu_bus_policy==2?4:6;
     if (bank >= 0x40 && bank <= 0x7f) return 8;
     if (bank >= 0xc0) return g_memsel ? 6 : 8;
     if (a >= 0x8000) {

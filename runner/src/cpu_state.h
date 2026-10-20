@@ -417,6 +417,10 @@ void   cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v);
  * interpreter's bridge shims use the plain accessors (they account
  * transfers themselves). */
 uint32_t  cpu_region_speed(uint32_t adr);
+/* Opt-in host policy: 0 retail, 1 FastROM mirrors, 2 FastROM + CPU headroom.
+ * Mode 2 also speeds CPU WRAM/internal work. MMIO/DMA, video/NMI frequency
+ * and guest bytes are unchanged. No other host opts in automatically. */
+extern uint8_t g_cpu_bus_policy;
 /* SNESRECOMP_WLOG_ADDR hook for direct-WRAM stores that bypass cpu_write8/16
  * (DMA A-bus writes in snes_write, WMDATA $2180). wa = g_ram offset. */
 void wlog_addr_note_direct(uint32_t wa, uint8_t v, const char *via);

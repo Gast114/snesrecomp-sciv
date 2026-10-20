@@ -15,6 +15,7 @@ uint64_t g_apu_last_sync_master;
 int g_interp_apu_driving;
 int snes_frame_counter;
 uint8 g_memsel;
+uint8_t g_cpu_bus_policy;
 int g_recomp_stack_top;
 uint16_t g_cpu_entry_s[64];
 
