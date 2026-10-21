@@ -96,7 +96,11 @@ void ConfigUseDebugMarkerDefaults(void) {
   kDefaultKbdControls[kKeys_DebugMarker] = C(SDLK_d);
 }
 void ConfigUseHdToggleDefaults(void) { kDefaultKbdControls[kKeys_ToggleHD] = C(SDLK_h); }
-void ConfigUseRuntimeMenuDefaults(void) { kDefaultKbdControls[kKeys_OpenSettings] = _(SDLK_ESCAPE); }
+void ConfigUseRuntimeMenuDefaults(void) {
+  kDefaultKbdControls[kKeys_OpenSettings] = _(SDLK_ESCAPE);
+  kDefaultKbdControls[kKeys_FrameInspection] = C(SDLK_p);
+  kDefaultKbdControls[kKeys_FrameAdvance] = C(SDLK_n);
+}
 #undef _
 #undef A
 #undef C
@@ -118,7 +122,7 @@ static const KeyNameId kKeyNameId[] = {
   S(Fullscreen), S(Reset),
   S(Pause), S(PauseDimmed), S(Turbo), S(WindowBigger), S(WindowSmaller), S(VolumeUp), S(VolumeDown), S(DisplayPerf), S(ToggleRenderer), S(ToggleWidescreen),
   S(SaveStateMenu), S(Rewind), S(Screenshot), S(OpenLauncher), S(DebugMarker),
-  S(ToggleHD), S(OpenSettings),
+  S(ToggleHD), S(OpenSettings), S(FrameInspection), S(FrameAdvance),
 };
 #undef S
 #undef M

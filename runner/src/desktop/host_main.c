@@ -255,6 +255,8 @@ static uint32 g_win_flags = SDL_WINDOW_RESIZABLE;
 static SDL_Window *g_window;
 
 static uint8 g_paused, g_turbo, g_cursor = true;
+static bool g_frame_inspection;
+static unsigned g_frame_steps;
 static uint8 g_current_window_scale;
 static uint32 g_input_state;
 /* Gamepad-driven SNES controller bits, kept separate from g_input_state
@@ -434,6 +436,20 @@ static int g_frozen_w, g_frozen_h;
  * and by frame blending, which advances its kept frame once per simulated
  * frame rather than once per present. */
 static unsigned g_present_frame;
+bool SnesDesktopFrameInspection(void) { return g_frame_inspection; }
+unsigned SnesDesktopInspectionFrame(void) { return g_present_frame; }
+void SnesDesktopSetFrameInspection(bool enabled) {
+  if (g_netplay_session) return;
+  g_frame_inspection = enabled;
+  g_paused = enabled;
+  g_frame_steps = 0;
+  g_reset_clock = true;
+}
+void SnesDesktopAdvanceFrame(void) {
+  if (g_netplay_session) return;
+  if (!g_frame_inspection) SnesDesktopSetFrameInspection(true);
+  if (g_frame_steps < 255) ++g_frame_steps;
+}
 
 #ifndef SNESRECOMP_FRAME_STAGING_HLE
 #define SNESRECOMP_FRAME_STAGING_HLE 0
@@ -1322,7 +1338,7 @@ static void DrawPpuFrameWithPerf(void) {
   bool staged = SNESRECOMP_FRAME_STAGING_HLE &&
                 frame_bytes <= sizeof(g_frame_stage);
 #if defined(SNESRECOMP_HOST_HAS_BLEND)
-  const bool blending = g_config.frame_blend && g_blend &&
+  const bool blending = !g_frame_inspection && g_config.frame_blend && g_blend &&
                         frame_bytes <= (size_t)kPpuBufWidth * 4u * 240u;
   staged |= blending;
 #endif
@@ -4202,6 +4218,10 @@ error_reading:;
 
     double event_profile_start = ProfileStart();
     while (SDL_PollEvent(&event)) {
+#if defined(SNESRECOMP_IMGUI_ESCAPE_SETTINGS)
+      if (g_frame_inspection && Cv4RuntimeSettingsImGuiProcessEvent(&event))
+        continue;
+#endif
       if (HandleDeviceEvent(&event))
         continue;
       switch (event.type) {
@@ -4218,9 +4238,11 @@ error_reading:;
         }
         break;
       case SDL_KEYDOWN:
-        if (SNESRECOMP_SDL_EVENT_REPEAT(event) &&
-            FindCmdForSdlKey(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event)) == kKeys_ToggleHD)
-          break;
+        if (SNESRECOMP_SDL_EVENT_REPEAT(event)) {
+          int command = FindCmdForSdlKey(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event));
+          if (command == kKeys_ToggleHD || command == kKeys_FrameInspection || command == kKeys_FrameAdvance)
+            break;
+        }
 #if defined(RECOMP_LAUNCHER)
         if (game->escape_settings &&
             FindCmdForSdlKey(SNESRECOMP_SDL_EVENT_KEY(event), SNESRECOMP_SDL_EVENT_MOD(event)) == kKeys_OpenSettings &&
@@ -4320,9 +4342,10 @@ error_reading:;
       SetAudioPaused(audiopaused);
     }
 
-    if (g_paused && !g_savestate_menu_hotkey && !g_rewind_hotkey &&
+    if (g_paused && !g_frame_steps && !g_savestate_menu_hotkey && !g_rewind_hotkey &&
         !g_open_launcher_hotkey && !g_debug_marker_hotkey) {
       snes_host_clock_reset(&video_clock, MonotonicSeconds(), g_simulation_hz, presentation_hz);
+      if (g_frame_inspection) PresentFrozenWithOverlay();
       SDL_Delay(16);
       continue;
     }
@@ -4453,7 +4476,7 @@ error_reading:;
     /* Pacing. A title that decouples presentation (presentation_hz hook)
      * gets re-presented between simulated frames from the captured field;
      * everyone else presents once per simulated frame. */
-    bool paced_realtime = !g_turbo && !g_config.disable_frame_delay;
+    bool paced_realtime = !g_frame_inspection && !g_turbo && !g_config.disable_frame_delay;
     bool paced_custom = PresentationDecoupled() && paced_realtime;
     double video_now = MonotonicSeconds();
     if (video_now >= next_display_check) {
@@ -4653,13 +4676,15 @@ error_reading:;
       GameReset();
       continue;   /* guest was frozen: no frame to run or present */
     }
-    if (g_paused) continue;
+    if (g_paused && !g_frame_steps) continue;
     /* A Lua client holding the machine admits no frame (step N releases N). */
     if (lua_bridge_paused()) {
       snes_host_clock_reset(&video_clock, MonotonicSeconds(), g_simulation_hz, presentation_hz);
       SDL_Delay(1);
       continue;
     }
+    bool frame_step = g_frame_inspection && g_frame_steps;
+    if (frame_step) --g_frame_steps;
     /* The script ticks HERE, after every path that can leave this iteration
      * without running a frame. Ticked above the overlay checks, an
      * iteration that opened a panel consumed a script frame the guest never
@@ -4686,7 +4711,7 @@ error_reading:;
     {
       const uint32 word = lua_bridge_frame_start(
           inputs | GetActiveControllers() | debug_server_get_controller_active_mask());
-      if (g_turbo || !snes_runahead_run_frame(word))
+      if (frame_step || g_turbo || !snes_runahead_run_frame(word))
         RtlRunFrame(word);
       else
         runahead_captured = true;   /* it rasterised the speculated frame */
@@ -4722,8 +4747,8 @@ error_reading:;
       host_report_breadcrumb("first frame simulated");
     else if (frameCtr % 3600 == 0)   /* ~once a minute at 60 fps */
       host_report_breadcrumb("heartbeat: frame=%u", frameCtr);
-    g_snes->disableRender = g_turbo && (frameCtr & 0xf) != 0;
-    snes_osd_set_turbo(g_turbo);
+    g_snes->disableRender = !frame_step && g_turbo && (frameCtr & 0xf) != 0;
+    snes_osd_set_turbo(!g_frame_inspection && g_turbo);
 
     profile_start = ProfileStart();
     /* Run-ahead already did this, from the speculated frame, before it
@@ -4749,7 +4774,7 @@ error_reading:;
     else
       snes_host_clock_reset(&video_clock, MonotonicSeconds(), g_simulation_hz, presentation_hz);
     if (!g_snes->disableRender &&
-        (!paced_custom || snes_host_clock_presentation_due(&video_clock, MonotonicSeconds()) ||
+        (frame_step || !paced_custom || snes_host_clock_presentation_due(&video_clock, MonotonicSeconds()) ||
          (run_frames && frameCtr >= run_frames))) {
       double presented_at = MonotonicSeconds();
       g_present_alpha = paced_custom && presentation_hz != g_simulation_hz
@@ -4758,6 +4783,7 @@ error_reading:;
       ++presentations;
       snes_host_clock_presentation_done(&video_clock, presented_at);
     }
+    if (frame_step) ResetAudioTimeline();
     if (run_frames && frameCtr >= run_frames) {
       running = false;
       exit_reason = "RUN_FRAMES reached";
@@ -4978,8 +5004,14 @@ static void HandleCommand(uint32 j, bool pressed) {
     case kKeys_Reset:
       ConsoleReset();
       break;
-    case kKeys_Pause: g_paused = !g_paused; break;
+    case kKeys_FrameInspection: SnesDesktopSetFrameInspection(!g_frame_inspection); break;
+    case kKeys_FrameAdvance: SnesDesktopAdvanceFrame(); break;
+    case kKeys_Pause:
+      if (g_frame_inspection) SnesDesktopSetFrameInspection(false);
+      else g_paused = !g_paused;
+      break;
     case kKeys_PauseDimmed:
+      if (g_frame_inspection) { SnesDesktopSetFrameInspection(false); break; }
       g_paused = !g_paused;
 #ifdef _WIN32
       if (g_paused && g_renderer) {

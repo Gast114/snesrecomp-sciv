@@ -68,6 +68,8 @@ enum {
   kKeys_DebugMarker,
   kKeys_ToggleHD,
   kKeys_OpenSettings,
+  kKeys_FrameInspection,
+  kKeys_FrameAdvance,
   kKeys_Total,
 };
 

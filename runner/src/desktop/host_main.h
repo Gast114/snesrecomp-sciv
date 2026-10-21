@@ -222,6 +222,12 @@ typedef struct SnesDesktopHostGame {
 } SnesDesktopHostGame;
 const char *SnesDesktopConfigPath(void);
 void SnesDesktopSetGesture(bool debug, const char *spec);
+/* Local frame inspection. Never advances a network session or run-ahead.
+ * Advance requests exactly one field and leaves the machine paused. */
+bool SnesDesktopFrameInspection(void);
+void SnesDesktopSetFrameInspection(bool enabled);
+void SnesDesktopAdvanceFrame(void);
+unsigned SnesDesktopInspectionFrame(void);
 
 /* The whole program. Returns the process exit code. */
 int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **argv);
