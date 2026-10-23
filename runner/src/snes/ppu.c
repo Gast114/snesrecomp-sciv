@@ -841,10 +841,34 @@ void ppu_runLine(Ppu* ppu, int line) {
       memset(ppu->hostObjOwners, 255, sizeof(ppu->hostObjOwners));
       memset(ppu->hostObjColors, 0, sizeof(ppu->hostObjColors));
     }
+    memset(ppu->hostSpriteWinners, 0, sizeof(ppu->hostSpriteWinners));
+    if (ppu->hostSpriteCount)
+      memset(ppu->hostSpriteColors, 0, sizeof(ppu->hostSpriteColors));
     if (ppu->overlayRenderBuffer[kPpuOverlaySource_Obj])
       memset(&ppu->overlayBuffers[kPpuOverlaySource_Obj], 0,
              sizeof(ppu->overlayBuffers[kPpuOverlaySource_Obj]));
     ppu->lineHasSprites = !PPU_forcedBlank(ppu) && ppu_evaluateSprites(ppu, line - 1);
+    if (ppu->hostSpriteCount && !PPU_forcedBlank(ppu)) {
+      unsigned first = PPU_objPriority(ppu) ? (ppu->oamaddl & 0xfe) >> 1 : 0;
+      for (size_t n = 0; n < ppu->hostSpriteCount; ++n) {
+        const PpuHostSprite *s = &ppu->hostSprites[n];
+        int row = line - 1 - s->y;
+        if (!s->pixels || row < 0 || row >= s->height) continue;
+        uint64_t rank = (uint64_t)((s->oamSlot-first)&127)<<32;
+        for (int col = 0; col < s->width; ++col) {
+          int x = s->x + col;
+          if (x < -(int)ppu->extraLeftCur || x >= 256+ppu->extraRightCur) continue;
+          int di = x+kPpuExtraLeftRight;
+          uint32_t rgba = s->pixels[row*s->stride+col];
+          if (!(rgba>>24) || rank >= ppu->objectOrder[di]) continue;
+          ppu->hostSpriteWinners[di] = (uint16_t)(n+1);
+          ppu->hostSpriteColors[di] = rgba;
+          ppu->objectOrder[di] = rank;
+          ppu->objBuffer.data[di] = s->priority | 0x80;
+          ppu->lineHasSprites = true;
+        }
+      }
+    }
     if (ppu->hostObjPixels && !PPU_forcedBlank(ppu)) {
       int row = line - 1 - ppu->hostObjY;
       if (row >= 0 && row < ppu->hostObjHeight) {
@@ -853,7 +877,15 @@ void ppu_runLine(Ppu* ppu, int line) {
           if (x < -(int)ppu->extraLeftCur || x >= 256 + ppu->extraRightCur) continue;
           int di = x + kPpuExtraLeftRight;
           uint32 rgba = ppu->hostObjPixels[row * ppu->hostObjStride + col];
-          if ((rgba >> 24) < 128 || ppu->hostObjOwners[di] < ppu->hostObjSlot) continue;
+          if ((rgba >> 24) < 128 || (!ppu->hostSpriteCount &&
+              ppu->hostObjOwners[di] < ppu->hostObjSlot)) continue;
+          if (ppu->hostSpriteCount) {
+            unsigned first = PPU_objPriority(ppu) ? (ppu->oamaddl & 0xfe)>>1 : 0;
+            uint64_t rank = (uint64_t)((ppu->hostObjSlot-first)&127)<<32;
+            if (rank >= ppu->objectOrder[di]) continue;
+            ppu->hostSpriteWinners[di] = 0;
+            ppu->objectOrder[di] = rank;
+          }
           ppu->hostObjColors[di] = rgba;
           /* OBJ palette index zero cannot occur in an opaque native sprite. */
           ppu->objBuffer.data[di] = ppu->hostObjPriority | 0x80;
@@ -1510,6 +1542,7 @@ bool PpuGetTileSource(Ppu *ppu, int x, unsigned line, uint16_t pixel,
       PPU_pseudoHires(ppu) || PPU_directColor(ppu)) return false;
   if (layer == 4 || layer == 6) {
     if (pixel != ppu->objBuffer.data[i] ||
+        ppu->hostSpriteWinners[i] ||
         (ppu->hostObjPixels && (ppu->hostObjColors[i] >> 24)) ||
         (ppu->extraObjectCount && (ppu->objectColors[i] & 0x8000))) return false;
     *s = ppu->hdObjects[i];
@@ -2319,6 +2352,12 @@ static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool clear_backdrop) {
 }
 
 static uint32 PpuHostColor(Ppu *ppu, uint16 pixel, unsigned x) {
+  unsigned owner = ppu->hostSpriteWinners[x];
+  if (owner && owner <= ppu->hostSpriteCount &&
+      pixel == (ppu->hostSprites[owner-1].priority | 0x80)) {
+    uint32_t c = ppu->hostSpriteColors[x];
+    return ((c>>19)&31) | (((c>>11)&31)<<5) | (((c>>3)&31)<<10);
+  }
   if (ppu->hostObjPixels && pixel == (ppu->hostObjPriority | 0x80) &&
       (ppu->hostObjColors[x] >> 24)) {
     uint32 c = ppu->hostObjColors[x];
@@ -3024,7 +3063,7 @@ bool PpuComposeExtraObjects(const PpuExtraObject *objects,size_t count,
 }
 
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
-  if(ppu->extraObjectCount) {
+  if(ppu->extraObjectCount || ppu->hostSpriteCount) {
     memset(ppu->objectColors,0,sizeof(ppu->objectColors));
     memset(ppu->objectOrder,0xff,sizeof(ppu->objectOrder));
   }
@@ -3074,6 +3113,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
 
   for(int i = spritesFound; i > 0; i--) {
     index = foundSprites[i - 1];
+    bool host_replaced = false;
+    for (size_t n = 0; n < ppu->hostSpriteCount; ++n)
+      if (ppu->hostSprites[n].mask[(index>>1)>>3] & (1u<<((index>>1)&7))) {
+        host_replaced = true; break;
+      }
+    if (host_replaced) continue;
     if (ppu->hostObjPixels &&
         (ppu->hostObjMask[(index >> 1) >> 3] & (1u << ((index >> 1) & 7)))) continue;
     uint8_t row = line - (ppu->oam[index] >> 8);
@@ -3189,7 +3234,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                       (uint8_t)(oam1 >> 14), 1};
                 }
                 if (ppu->hostObjPixels) ppu->hostObjOwners[dst - ppu->objBuffer.data] = (uint8)slot;
-                if(ppu->extraObjectCount)
+                if(ppu->extraObjectCount || ppu->hostSpriteCount)
                   ppu->objectOrder[dst-ppu->objBuffer.data]=(uint64_t)((slot-first_slot)&127)<<32;
             }
         }

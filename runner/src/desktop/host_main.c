@@ -2289,7 +2289,8 @@ static void RewindKeyDown(int key, int repeat) {
   case SDLK_RIGHT:  snes_rewind_step(+1); break;
   case SDLK_RETURN:
   case SDLK_SPACE:  snes_rewind_commit(); break;
-  case SDLK_ESCAPE: snes_rewind_close();  break;
+  case SDLK_ESCAPE:
+  case SDLK_BACKSPACE: snes_rewind_close(); break;
   default: break;
   }
 }
@@ -2352,11 +2353,32 @@ static void RunRewindLoop(bool *running) {
   uint32 held_dir = 0;
   uint32 held_since = 0, last_repeat = 0;
   unsigned frames = 0;
+  const char *key_test = HostGetenv("REWIND_KEY_SELFTEST");
+  static unsigned key_test_opens;
+  if (key_test && ++key_test_opens != 1) {
+    fprintf(stderr,"[rewind_key_selftest] FAIL: rewind reopened without a new key press\n");
+    snes_rewind_close();*running=false;return;
+  }
   host_report_breadcrumb("rewind filmstrip OPEN - guest frozen until it closes "
                          "(pad B, or Escape; Left/Right scrub, A or Enter commits)");
   g_overlay_modal = true;
   SetAudioPaused(true);
   while (snes_rewind_is_open() && *running) {
+    if(key_test && (frames==2 || frames==6)) {
+      SDL_Event e={0};e.type=SDL_KEYDOWN;
+      int key=frames==2?SDLK_LEFT:!strcmp(key_test,"commit")?SDLK_RETURN:SDLK_ESCAPE;
+#if SNESRECOMP_SDL3
+      e.key.key=key;
+#else
+      e.key.keysym.sym=key;
+#endif
+      SDL_PushEvent(&e);e.type=SDL_KEYUP;SDL_PushEvent(&e);
+      if(frames==6)fprintf(stderr,"[rewind_key_selftest] selected %.3fs; %s\n",snes_rewind_selected_seconds(),key_test);
+    }
+    if(key_test && frames==40) {
+      fprintf(stderr,"[rewind_key_selftest] FAIL: keyboard could not close rewind\n");
+      snes_rewind_close();*running=false;
+    }
     PumpOverlayEvents(running, &RewindKeyDown);
     if (!*running)
       snes_rewind_close();
@@ -4298,6 +4320,19 @@ error_reading:;
     }
 #endif
     OverlaySelftestPadMainTick(frameCtr);
+    {
+      static bool rewind_key_test_done;
+      if(HostGetenv("REWIND_KEY_SELFTEST") && !rewind_key_test_done && frameCtr>=1295) {
+        rewind_key_test_done=true;
+        SDL_Event e={0};e.type=SDL_KEYDOWN;
+#if SNESRECOMP_SDL3
+        e.key.key=SDLK_F8;
+#else
+        e.key.keysym.sym=SDLK_F8;
+#endif
+        SDL_PushEvent(&e);e.type=SDL_KEYUP;SDL_PushEvent(&e);
+      }
+    }
     /* Opt-in regression: real SDL dispatch, including an OS repeat. */
     {
       static bool key_test_done;
@@ -4631,6 +4666,10 @@ error_reading:;
     g_open_launcher_hotkey = 0;
     if ((g_rewind_hotkey || PadGesturePressed(&g_rewind_gesture)) && !snes_rewind_is_open() &&
         !snes_savestate_menu_is_open()) {
+      /* Consume the opening edge before the modal loop. Its successful
+       * return continues this loop, so clearing it afterwards reopened the
+       * browser immediately on every attempt to accept or cancel. */
+      g_rewind_hotkey = 0;
       /* Refused during netplay by snes_rewind_open() itself: one machine
        * cannot move its own clock backwards while a peer is watching. */
       if (snes_rewind_open()) {

@@ -100,6 +100,16 @@ typedef struct PpuExtraObject {
   const uint16_t *pixels;
 } PpuExtraObject;
 
+/* Complete host sprite replacements. Their opaque native-size coverage proxy
+ * participates in ordinary OBJ ownership; the title may sample finer artwork
+ * using hostSpriteWinners (index + 1, zero means original/legacy host OBJ). */
+typedef struct PpuHostSprite {
+  const uint32_t *pixels;
+  int x, y, width, height, stride;
+  uint16_t priority;
+  uint8_t oamSlot, mask[16];
+} PpuHostSprite;
+
 #if defined(_MSC_VER)
 #define PPU_ALIGN8_PRE __declspec(align(8))
 #define PPU_ALIGN8_POST
@@ -200,6 +210,10 @@ struct Ppu {
   uint8_t hostObjSlot, hostObjMask[16];
   uint8_t hostObjOwners[kPpuBufWidth];
   uint32_t hostObjColors[kPpuBufWidth];
+  const PpuHostSprite *hostSprites;
+  size_t hostSpriteCount;
+  uint16_t hostSpriteWinners[kPpuBufWidth];
+  uint32_t hostSpriteColors[kPpuBufWidth];
   // Snes registers. Saved to snapshot. Need to be stable
   // -- START OF SNAPSHOT, 0x40 bytes
   uint8 inidisp;
@@ -424,6 +438,12 @@ bool PpuComposeExtraObjects(const PpuExtraObject *objects, size_t count,
     uint16_t *depth, uint16_t *colors, uint64_t *order);
 static inline uint16_t PpuPixelColor(const Ppu *ppu, uint16_t pixel, size_t x) {
   unsigned layer=(pixel>>8)&15;
+  unsigned owner=ppu->hostSpriteWinners[x];
+  if (owner && owner<=ppu->hostSpriteCount &&
+      pixel==(ppu->hostSprites[owner-1].priority|0x80)) {
+    uint32_t c=ppu->hostSpriteColors[x];
+    return ((c>>19)&31)|(((c>>11)&31)<<5)|(((c>>3)&31)<<10);
+  }
   if (ppu->extraObjectCount && (layer==4 || layer==6) &&
       (ppu->objectColors[x]&0x8000)) return ppu->objectColors[x]&0x7fff;
   return ppu->cgram[pixel&255];
